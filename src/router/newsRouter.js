@@ -136,7 +136,6 @@ newsRouter.delete("/:id", (req, res) => {
     let id = req.params.id;
     let newData = {...appDB};
     newData.news = newData.news.filter((item)=> item.id != id);
-    console.log(newData.news);
     fs.writeFile(path.join(__dirname, "../", "db.json"), JSON.stringify(newData), {encoding: "utf8", flag: "w"}, (err)=>{
         if(err){
             res.status(400).json({
