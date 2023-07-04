@@ -44,7 +44,7 @@ authRouter.post("/", (req, res)=>{
         id: checkUserExistance.id,
         email: checkUserExistance.email,
         name: checkUserExistance.name,
-        expiresIn: "1h"
+        exp: Math.floor(new Date() / 1000) + (60*60)
     }
     const token = jwt.sign(payload, process.env.SECRET_KEY);
 
@@ -54,9 +54,6 @@ authRouter.post("/", (req, res)=>{
         message: "Login Successfull.",
         token: token,
     });
-
-
-    res.send("login");
 });
 
 module.exports = authRouter;

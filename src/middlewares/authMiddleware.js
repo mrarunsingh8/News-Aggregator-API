@@ -1,14 +1,24 @@
 const jwt = require("jsonwebtoken");
 
 const authMiddleware = (req, res, next) => {
-    if (req.headers && req.headers.authorization && req.headers.authorization.startsWith('JWT ')) {
-        let token = req.headers.authorization.split(' ')[1];
+    let token = req.headers.authorization;
+    if (token && token.trim().length !== 0 && token.startsWith('JWT ')) {
+        token = token.slice(4, token.length);
+    }
+    try {
+        var decoded = jwt.verify(token, process.env.SECRET_KEY);
+        req.user = decoded;
+        next();
+    } catch(err) {
+        res.status(401).json({
+            statusCode: 401,
+            dateTime: new Date,
+            description: "Unauthorized access!"
+        })
+    }
 
-        try {
-            var decoded = jwt.verify(token, process.env.SECRET_KEY);
-            req.user = decoded;
-            next();
-        } catch (err) {
+    jwt.verify(token, process.env.SECRET_KEY, (err, decoded)=>{
+        if(err){
             return res.status(401).json({
                 statusCode: 401,
                 dateTime: new Date(),
@@ -16,8 +26,9 @@ const authMiddleware = (req, res, next) => {
                 //error: new Error('Invalid token')
             });
         }
-
-    }
+        req.user = decoded;
+        //next();
+    });
     return res.status(401).json({
         statusCode: 401,
         dateTime: new Date(),
