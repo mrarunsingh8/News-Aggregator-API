@@ -42,70 +42,125 @@ It will start a server for production use.
 
 ## API Reference
 
-#### Get `news`
-
-##### Get all news
+##### Register a user
 
 ```http
-  GET /api/news
+   GET /register
 ```
 
-##### Get a perticular `news` by id
+| Body | Type     | Description                       |
+| :-------- | :------- | :-------------------------------- |
+| `name`      | `string` | **Required**. name |
+| `email`      | `string` | **Required**. password |
+| `name`      | `string` | **Required**. password |
+
+##### Login a user
+
+| Body | Type     | Description                       |
+| :-------- | :------- | :-------------------------------- |
+| `email`      | `string` | **Required**. password |
+| `name`      | `string` | **Required**. password |
+
+##### Get Everything news
 
 ```http
-  GET /api/news/${id}
+  GET /news
 ```
+
+##### Get news by users preference
+
+```http
+  GET /news
+```
+
+
+| Headers | Type     | Description                       |
+| :-------- | :------- | :-------------------------------- |
+| `Authorization`      | `JWT ${token}` | **Required**. JWT authentication token if get news by users preference |
+
+##### Get the news by users preferences
+
+```http
+  GET /preferences
+```
+
+| Header | Type     | Description                       |
+| :-------- | :------- | :-------------------------------- |
+| `Authorization`      | `JWT ${token}` |  **Required**. JWT authentication token |
+
+##### create the users news preferences
+
+```http
+  PUT /preferences
+```
+
+| Header | Type     | Description                       |
+| :-------- | :------- | :-------------------------------- |
+| `Authorization`      | `JWT ${token}` |  **Required**. JWT authentication token |
+
+| Body | Type     | Description                       |
+| :-------- | :------- | :-------------------------------- |
+| `preference`      | `string` |  **Required**. Users preference |
+
+
+##### Mark a news article as read
+
+```http
+  PUT /:id/read
+```
+
+| Header | Type     | Description                       |
+| :-------- | :------- | :-------------------------------- |
+| `Authorization`      | `JWT ${token}` |  **Required**. JWT authentication token |
 
 | Parameter | Type     | Description                       |
 | :-------- | :------- | :-------------------------------- |
-| `id`      | `string` | **Required**. Id of News to fetch |
+| `id`      | `string` |  **Required**. newsId |
 
-#### Create a new news
-
-```http
-  POST /api/news/
-```
 
 | Body | Type     | Description                       |
 | :-------- | :------- | :-------------------------------- |
-| `id`      | `string` | **Required**. Id of News |
-| `title`      | `string` | **Optional**. title of News |
-| `description`      | `string` | **Optional**. description of News |
+| `newsData`      | `Object` |  **Required**. newsData |
 
-
-#### Update a news
+##### Get the user's read news
 
 ```http
-  PUT /api/news/
+  GET /news/read
 ```
 
-| Body | Type     | Description                       |
+| Header | Type     | Description                       |
 | :-------- | :------- | :-------------------------------- |
-| `id`      | `string` | **Required**. Id of News |
-| `title`      | `string` | **Optional**. title of News |
-| `description`      | `string` | **Optional**. description of News |
+| `Authorization`      | `JWT ${token}` |  **Required**. JWT authentication token |
 
 
-#### Partial Update a News
-
-##### Update the `title` for a news
+##### Mark a news article as favorite
 
 ```http
-  PATCH /api/news/
+  PUT /:id/favorite
 ```
 
-| Body | Type     | Description                       |
+| Header | Type     | Description                       |
 | :-------- | :------- | :-------------------------------- |
-| `id`      | `string` | **Required**. Id of News |
-| `title`      | `string` | **Required**. title of News |
-
-#### Delete a news by id
-
-```http
-  DELETE /api/news/${id}
-```
+| `Authorization`      | `JWT ${token}` |  **Required**. JWT authentication token |
 
 | Parameter | Type     | Description                       |
 | :-------- | :------- | :-------------------------------- |
-| `id`      | `string` | **Required**. Id of News to delete |
+| `id`      | `string` |  **Required**. newsId |
+
+
+| Body | Type     | Description                       |
+| :-------- | :------- | :-------------------------------- |
+| `newsData`      | `Object` |  **Required**. newsData |
+
+##### Get the favorite news by users
+
+```http
+  GET /news/favorite
+```
+
+| Header | Type     | Description                       |
+| :-------- | :------- | :-------------------------------- |
+| `Authorization`      | `JWT ${token}` |  **Required**. JWT authentication token |
+
+
 
