@@ -45,7 +45,7 @@ It will start a server for production use.
 ##### Register a user
 
 ```http
-   GET /register
+   POST /register
 ```
 
 | Body | Type     | Description                       |
@@ -55,7 +55,9 @@ It will start a server for production use.
 | `name`      | `string` | **Required**. password |
 
 ##### Login a user
-
+```http
+   POST /login
+```
 | Body | Type     | Description                       |
 | :-------- | :------- | :-------------------------------- |
 | `email`      | `string` | **Required**. password |
