@@ -1,154 +1,159 @@
 const express = require("express");
-const appDB = require("./../db.json");
-const newsRouter = express.Router();
 const fs = require("fs");
 const path = require("path");
+const newsServices = require("../services/newsServices");
+
+const newsRouter = express.Router();
+
+const appData = require("../db.json");
+const authMiddleware = require("../middlewares/authMiddleware");
 
 newsRouter.get("/", (req, res)=>{
-    const data = appDB.news;
-
-    res.status(200).json({
-        statusCode: 200,
-        data: data
-    });
-});
-
-newsRouter.get("/:id", (req, res) => {
-    let id  = req.params.id;
-    const data = appDB.news.filter((item)=>{
-        return item.id == id;
-    });    
-    if(data.length > 0){
-        res.status(200).json({
-            statusCode: 200,
-            data: data[0]
+    if(!req.user){
+        newsServices.getNewsEverything().then(news=>{
+            return res.status(200).json({
+                statusCode: 200,
+                dateTime: new Date(),
+                news: news
+            });
+        }).catch((err)=>{
+            return res.status(400).json({
+                statusCode: 400,
+                dateTime: new Date(),
+                message: err.message,
+                errors: err,
+            });
         });
     }else{
-        res.status(404).json({
-            statusCode: 404,
-            data: {}
-        });
-    }
-});
-
-newsRouter.post("/", (req, res) => {
-    let reqBody = req.body;
-    let data = appDB.news.filter((item)=> item.id === reqBody.id);
-
-    if(data.length > 0){
-        res.status(400).json({
-            statusCode: 400,
-            error: `Bad Request! id ${reqBody.id} already exist in DB.`
-        });
-    }else{
-        let newData = {...appDB};
-        newData.news.push(reqBody);
-        fs.writeFile(path.join(__dirname, "../", "db.json"), JSON.stringify(newData), {encoding: "utf8", flag: "w"}, (err)=>{
-            if(err){
-                res.status(400).json({
-                    statusCode: 400,
-                    error: err.message
-                });
-            }else{
-                res.status(200).json({
-                    statusCode: 200,
-                    message: "A news has beed added succuessfully."
-                });
+        let user = (appData.users).filter((item) => {
+            if(item.id == req.user.id){
+                return item??[];
             }
         });
-    }
-});
-
-newsRouter.put("/", (req, res) => {
-    let reqBody = req.body;
-    let data = appDB.news.filter((item)=> item.id === reqBody.id);
-
-    if(data.length > 0){
-        let newData = {...appDB};
-        newData.news = newData.news.map((item)=>{
-            if(item.id === reqBody.id){
-                return {
-                    ...item,
-                    title: reqBody.title,
-                    description: reqBody.description
-                }
-            }
-            return item;
-        });
-        fs.writeFile(path.join(__dirname, "../", "db.json"), JSON.stringify(newData), {encoding: "utf8", flag: "w"}, (err)=>{
-            if(err){
-                res.status(400).json({
-                    statusCode: 400,
-                    error: err.message
-                });
-            }else{
-                res.status(200).json({
-                    statusCode: 200,
-                    message: `The news is updated for the id: ${reqBody.id}`
-                });
-            }
-        });
-    }else{
-        res.status(400).json({
-            statusCode: 400,
-            error: `Bad Request! id ${reqBody.id} doesn't exist in DB.`
-        });
-    }
-});
-
-newsRouter.patch("/", (req, res) => {
-    let reqBody = req.body;
-    let data = appDB.news.filter((item)=> item.id === reqBody.id);
-    if(data.length > 0){
-        let newData = {...appDB};
-        newData.news = newData.news.map((item)=>{
-            if(item.id === reqBody.id){
-                return {
-                    ...item,
-                    title: reqBody.title
-                }
-            }
-            return item;
-        });
-        fs.writeFile(path.join(__dirname, "../", "db.json"), JSON.stringify(newData), {encoding: "utf8", flag: "w"}, (err)=>{
-            if(err){
-                res.status(400).json({
-                    statusCode: 400,
-                    error: err.message
-                });
-            }else{
-                res.status(200).json({
-                    statusCode: 200,
-                    message: `The news is updated for the id: ${reqBody.id}`
-                });
-            }
-        });
-    }else{
-        res.status(400).json({
-            statusCode: 400,
-            error: `Bad Request! id ${reqBody.id} doesn't exist in DB.`
-        });
-    }
-});
-
-
-newsRouter.delete("/:id", (req, res) => {
-    let id = req.params.id;
-    let newData = {...appDB};
-    newData.news = newData.news.filter((item)=> item.id != id);
-    fs.writeFile(path.join(__dirname, "../", "db.json"), JSON.stringify(newData), {encoding: "utf8", flag: "w"}, (err)=>{
-        if(err){
+        let category = "";
+        if(user.length > 0){
+            category = user[0].preference;
+        }
+        newsServices.getnewsByCategories(category).then(news=>{
+            return res.status(200).json({
+                statusCode: 200,
+                dateTime: new Date(),
+                news: news
+            });
+        }).catch((err)=>{
             res.status(400).json({
                 statusCode: 400,
-                error: err.message
+                dateTime: new Date(),
+                message: err.message,
+                errors: err,
             });
-        }else{
-            res.status(200).json({
-                statusCode: 200,
-                message: `The news is deleted for the id: ${id}`
-            });
+        });
+    }
+});
+
+newsRouter.get("/read", authMiddleware, (req, res) => {
+    let filteredUser = appData.users.filter((item) => {
+        if(item.id == req.user.id){
+            return item;
         }
     });
+
+    if(filteredUser[0].read){
+        return res.status(200).json({
+            statusCode: 200,
+            data: filteredUser[0].read
+        });
+    }else{
+        return res.status(200).json({
+            statusCode: 200,
+            message: `No record found.`
+        });
+    }
+});
+
+
+newsRouter.post("/:id/read", authMiddleware, (req,res)=>{
+    let newsId = req.params.id;
+    let news = req.body;
+    appData.users.map((item)=>{
+        if(item.id == req.user.id){
+            item.read = (item.read)?item.read:[];
+            let isExist = false;
+            item.read = (item.read).map((readItem) => {
+                if(readItem.id == newsId){
+                    isExist = true;
+                }
+            });
+            if(!isExist){
+                (item.read).push(news);
+            }
+        }
+        return item;
+    });
+    try{
+        fs.writeFileSync(path.join(__dirname, "../", "db.json"), JSON.stringify(appData), {encoding: "utf8", flag: "w"});
+        return res.status(200).json({
+            statusCode: 200,
+            message: `The news has been marked now as read`
+        });
+    }catch(err){
+        return res.status(200).json({
+            statusCode: 400,
+            error: err
+        });
+    };
+});
+
+newsRouter.get("/favorite", authMiddleware, (req, res) => {
+    let filteredUser = appData.users.filter((item) => {
+        if(item.id == req.user.id){
+            return item;
+        }
+    });
+
+    if(filteredUser[0].favorites){
+        return res.status(200).json({
+            statusCode: 200,
+            data: filteredUser[0].favorites
+        });
+    }else{
+        return res.status(200).json({
+            statusCode: 200,
+            message: `No record found.`
+        });
+    }
+});
+
+newsRouter.post("/:id/favorite", authMiddleware, (req,res)=>{
+    let newsId = req.params.id;
+    let news = req.body;
+    appData.users.map((item)=>{
+        if(item.id == req.user.id){
+            item.favorites = (item.favorites)?item.favorites:[];
+            let isExist = false;
+            item.favorites = (item.favorites).map((fabItem) => {
+                if(fabItem.id == newsId){
+                    isExist = true;
+                }
+            });
+            if(!isExist){
+                (item.favorites).push(news);
+            }
+        }
+        return item;
+    });
+    try{
+        fs.writeFileSync(path.join(__dirname, "../", "db.json"), JSON.stringify(appData), {encoding: "utf8", flag: "w"});
+        return res.status(200).json({
+            statusCode: 200,
+            message: `The news has been marked now as favorite`
+        });
+    }catch(err){
+        return res.status(200).json({
+            statusCode: 400,
+            error: err
+        });
+    };
 });
 
 module.exports = newsRouter;

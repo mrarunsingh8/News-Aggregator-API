@@ -2,25 +2,29 @@ require('dotenv').config()
 const express = require("express");
 const bodyParser = require("body-parser");
 
-const authRouter = require("./router/authRouter");
 const newsRouter = require("./router/newsRouter");
 const userRouter = require("./router/userRouter");
 const authMiddleware = require('./middlewares/authMiddleware');
+const preferenceRouter = require('./router/preferenceRouter');
+const jwtMiddleware = require('./middlewares/jwtMiddleware');
+const perfectExpressSanitizer = require('perfect-express-sanitizer');
 
 const app = express();
 
 app.use(bodyParser.urlencoded({extended: false}));
 app.use(bodyParser.json());
 
-app.get("/", (req, res)=>{
-    res.send("Hello World");
-});
+app.use(perfectExpressSanitizer.clean({
+    xss: true,
+    noSql: true,
+    sql: true
+}));
 
-app.use("/api/v1/login", authRouter);
+app.use("/", userRouter);
 
-app.use("/api/v1", userRouter);
+app.use("/preferences", authMiddleware, preferenceRouter);
 
-app.use("/api/v1/news", authMiddleware, newsRouter);
+app.use("/news", jwtMiddleware, newsRouter);
 
 app.listen(3000, (err)=>{
     if(err) console.error("Error", err);
