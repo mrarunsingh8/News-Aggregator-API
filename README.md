@@ -106,7 +106,7 @@ It will start a server for production use.
 ##### Mark a news article as read
 
 ```http
-  PUT /:id/read
+  PUT /news/:id/read
 ```
 
 | Header | Type     | Description                       |
@@ -136,7 +136,7 @@ It will start a server for production use.
 ##### Mark a news article as favorite
 
 ```http
-  PUT /:id/favorite
+  PUT /news/:id/favorite
 ```
 
 | Header | Type     | Description                       |
