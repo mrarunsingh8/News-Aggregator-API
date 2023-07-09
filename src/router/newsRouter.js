@@ -5,12 +5,17 @@ const newsServices = require("../services/newsServices");
 
 const newsRouter = express.Router();
 
-const appData = require("../db.json");
 const authMiddleware = require("../middlewares/authMiddleware");
+const cacheMiddleware = require("../middlewares/cacheMiddleware");
 
-newsRouter.get("/", (req, res)=>{
+const cacheDb = require("../cache.json");
+const appData = require("../db.json");
+
+newsRouter.get("/", cacheMiddleware, (req, res)=>{
     if(!req.user){
         newsServices.getNewsEverything().then(news=>{
+            let newDb = {...cacheDb, [req.cacheKey]: {expireAt: new Date((new Date()).getTime() + 10 * 60000), news}};
+            fs.writeFileSync(path.join(__dirname, "../", "cache.json"), JSON.stringify(newDb), {encoding: "utf8", flag: "w"});
             return res.status(200).json({
                 statusCode: 200,
                 dateTime: new Date(),
@@ -35,6 +40,8 @@ newsRouter.get("/", (req, res)=>{
             category = user[0].preference;
         }
         newsServices.getnewsByCategories(category).then(news=>{
+            let newDb = {...cacheDb, [req.cacheKey]: {expireAt: new Date((new Date()).getTime() + 10 * 60000), news}};
+            fs.writeFileSync(path.join(__dirname, "../", "cache.json"), JSON.stringify(newDb), {encoding: "utf8", flag: "w"});
             return res.status(200).json({
                 statusCode: 200,
                 dateTime: new Date(),
