@@ -30,6 +30,13 @@ Start the server for development mode
 ```bash
   npm run dev
 ```
+
+
+To run the test cases
+
+```bash
+  npm run test
+```
 It will start a server for development use with url http://localhost:3000/.
 
 Start the server production mode
