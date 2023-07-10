@@ -2,7 +2,7 @@ const preferenceRouter = require("express").Router();
 const fs = require("fs");
 const path = require("path");
 
-const appData = require("../db.json");
+const appDB = require(`../${process.env.FILE_DB_NAME}`);
 const preferenceValidator = require("../validators/preferenceValidator");
 
 preferenceRouter.get("/", (req, res)=>{

@@ -4,9 +4,9 @@
   "description": "",
   "main": "./src/app.js",
   "scripts": {
-    "dev": "nodemon ./src/app",
-    "start": "node ./src/app",
-    "test": "echo \"Error: no test specified\" && exit 1"
+    "dev": "set NODE_ENV=development && nodemon index.js",
+    "start": "set NODE_ENV=development && index.js",
+    "test": "set NODE_ENV=test && mocha tests/**/*.test.js --exit"
   },
   "author": "Arun Singh",
   "license": "ISC",
@@ -23,6 +23,10 @@
     "uuid": "^9.0.0"
   },
   "devDependencies": {
-    "nodemon": "^2.0.22"
+    "chai": "^4.3.7",
+    "chai-http": "^4.4.0",
+    "mocha": "^10.2.0",
+    "nodemon": "^2.0.22",
+    "sinon": "^15.2.0"
   }
 }

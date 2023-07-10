@@ -1,4 +1,6 @@
-require('dotenv').config()
+const envFile = (process.env.NODE_ENV == "production") ? "./.env" : `./.${process.env.NODE_ENV.trim()}.env`;
+console.log(envFile);
+require("dotenv").config({ path: envFile });
 const express = require("express");
 const bodyParser = require("body-parser");
 
@@ -26,7 +28,4 @@ app.use("/preferences", authMiddleware, preferenceRouter);
 
 app.use("/news", jwtMiddleware, newsRouter);
 
-app.listen(3000, (err)=>{
-    if(err) console.error("Error", err);
-    console.log("Server started on Port: 3000");
-});
+module.exports = app;

@@ -5,7 +5,7 @@ const fs  =require("fs");
 const bcrypt = require("bcrypt");
 const jwt = require("jsonwebtoken");
 
-const appDB = require("../db.json");
+const appDB = require(`../${process.env.FILE_DB_NAME}`);
 const loginValidator = require("../validators/loginValidator");
 const userValidator = require("../validators/userValidator");
 
@@ -97,7 +97,7 @@ userRouter.post("/register", (req, res) => {
     userData.id = uuid.v1();
     userData.password = bcrypt.hashSync(userData.password, 5);
     appDB.users.push(userData);
-    let filePath = path.join(__dirname, "../", "db.json");
+    let filePath = path.join(__dirname, "../", `${process.env.FILE_DB_NAME}`);
     fs.writeFileSync(filePath, JSON.stringify(appDB), {encoding: "utf8", flag: "w"});
     return res.status(201).json({
         statusCode: 201,

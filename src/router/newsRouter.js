@@ -9,7 +9,7 @@ const authMiddleware = require("../middlewares/authMiddleware");
 const cacheMiddleware = require("../middlewares/cacheMiddleware");
 
 const cacheDb = require("../cache.json");
-const appData = require("../db.json");
+const appDB = require(`../${process.env.FILE_DB_NAME}`);
 
 newsRouter.get("/", cacheMiddleware, (req, res)=>{
     if(!req.user){
