@@ -13,7 +13,7 @@ const authMiddleware = (req, res, next) => {
             res.status(401).json({
                 statusCode: 401,
                 dateTime: new Date,
-                description: "Unauthorized access!"
+                message: "Unauthorized access!"
             })
         }
     }else{

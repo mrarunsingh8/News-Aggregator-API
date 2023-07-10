@@ -26,7 +26,7 @@ userRouter.post("/login", (req, res)=>{
         });
     }
 
-    let checkUserExistance = appDB.users.filter(item => item.email === postData.email);
+    let checkUserExistance = (appDB.users)?appDB.users.filter(item => item.email === postData.email):[];
     checkUserExistance = (checkUserExistance.length > 0)?checkUserExistance[0]:{};
     if (!(Object.keys(checkUserExistance).length > 0)) {
         return res.status(400).json({

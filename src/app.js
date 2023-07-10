@@ -1,6 +1,7 @@
-const envFile = (process.env.NODE_ENV == "production") ? "./.env" : `./.${process.env.NODE_ENV.trim()}.env`;
+const envFile = (process.env.NODE_ENV !== "test") ? ".env" : `.${process.env.NODE_ENV.trim()}.env`;
 console.log(envFile);
 require("dotenv").config({ path: envFile });
+
 const express = require("express");
 const bodyParser = require("body-parser");
 

@@ -8,6 +8,12 @@ const app = require("./../../src/app");
 
 chai.use(chaiHttp);
 
+var authToken;
+
+const setAuthToken = (token) => {
+  authToken = token;
+};
+
 describe("/register User Registration", () => {
   beforeEach(function (done) {
     let filePath = path.join(
@@ -39,10 +45,10 @@ describe("/register User Registration", () => {
           return done(err);
         }
         const { body } = res;
-        chai.expect(res).to.have.status(201);
-        chai.expect(body).to.have.property("statusCode");
-        chai.expect(body).to.have.property("dateTime").that.is.a("string");
-        chai.expect(body).to.have.property("message").that.is.an("string");
+        chai.expect(res).status(201);
+        chai.expect(body).property("statusCode");
+        chai.expect(body).property("dateTime").that.is.a("string");
+        chai.expect(body).property("message").that.is.an("string");
       });
 
     done();
@@ -98,8 +104,6 @@ describe("/register User Registration", () => {
 });
 
 describe("/login Login User", () => {
-  let authToken = "";
-
   it("/login validation error", (done) => {
     const userMock = {
       email: "test1@gmail.com",
@@ -203,9 +207,13 @@ describe("/login Login User", () => {
           .to.have.property("message")
           .that.is.an("string")
           .equals("Login Successfull.");
-        authToken = body.authToken;
+        setAuthToken(`JWT ${body.token}`);
       });
 
     done();
   });
 });
+
+module.exports = {
+  getAuthToken: () => authToken,
+};
