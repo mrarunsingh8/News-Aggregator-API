@@ -4,7 +4,7 @@ const chaiHttp = require("chai-http");
 const path = require("path");
 const fs = require("fs");
 
-const app = require("./../../src/app");
+const app = require("../../src/app");
 
 const { getAuthToken } = require("./userRouter.test");
 
@@ -20,7 +20,7 @@ describe("/preferences Preference Router", () => {
     done();
   });
 
-  it("GET /preferences JWT Token Missing ", (done) => {
+  it("GET /preferences should return JWT Token Missing ", (done) => {
     
     chai
       .request(app)
@@ -41,7 +41,7 @@ describe("/preferences Preference Router", () => {
     done();
   });
 
-  it("/preferences unauthorized access", (done) => {
+  it("GET /preferences should return unauthorized access", (done) => {
     
     chai
       .request(app)
@@ -62,7 +62,7 @@ describe("/preferences Preference Router", () => {
     done();
   });
 
-  it("/preferences Put validation error.", (done) => {
+  it("PUT /preferences should return validation error.", (done) => {
     const data = {
         preference: ""
     };
@@ -82,7 +82,7 @@ describe("/preferences Preference Router", () => {
     done();
   });
 
-  it("/preferences Put Users preferences", (done) => {
+  it("PUT /preferences should return success", (done) => {
     const data = {
         preference: "general"
     };
@@ -106,7 +106,7 @@ describe("/preferences Preference Router", () => {
     done();
   });
 
-  it("/preferences Get Users preferences", (done) => {
+  it("GET /preferences should return success", (done) => {
     
     chai
       .request(app)
@@ -122,6 +122,5 @@ describe("/preferences Preference Router", () => {
       });
     done();
   });
-
 
 });

@@ -1,4 +1,4 @@
-const envFile = (process.env.NODE_ENV !== "test") ? ".env" : `.${process.env.NODE_ENV.trim()}.env`;
+const envFile = (process.env.NODE_ENV !== "test") ? ".env" : `.${process.env.NODE_ENV}.env`;
 console.log(envFile);
 require("dotenv").config({ path: envFile });
 

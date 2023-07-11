@@ -212,6 +212,25 @@ describe("/login Login User", () => {
 
     done();
   });
+
+  
+  after("Reset the DB after all the Login and registration", ()=>{
+    beforeEach(function (done) {
+      let filePath = path.join(
+        __dirname,
+        "../",
+        "../",
+        "src",
+        `${process.env.FILE_DB_NAME}`
+      );
+      fs.writeFileSync(filePath, JSON.stringify({}), {
+        encoding: "utf8",
+        flag: "w",
+      });
+      done();
+    });
+  })
+
 });
 
 module.exports = {

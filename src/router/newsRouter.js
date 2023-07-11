@@ -9,7 +9,7 @@ const authMiddleware = require("../middlewares/authMiddleware");
 const cacheMiddleware = require("../middlewares/cacheMiddleware");
 
 const cacheDb = require("../cache.json");
-const appDB = require(`../${process.env.FILE_DB_NAME}`);
+const appData = require(`../${process.env.FILE_DB_NAME}`);
 
 newsRouter.get("/", cacheMiddleware, (req, res)=>{
     if(!req.user){
@@ -65,7 +65,7 @@ newsRouter.get("/read", authMiddleware, (req, res) => {
         }
     });
 
-    if(filteredUser[0].read){
+    if(filteredUser && filteredUser.length > 0 && filteredUser[0].read){
         return res.status(200).json({
             statusCode: 200,
             data: filteredUser[0].read
@@ -73,6 +73,7 @@ newsRouter.get("/read", authMiddleware, (req, res) => {
     }else{
         return res.status(200).json({
             statusCode: 200,
+            data: [],
             message: `No record found.`
         });
     }
@@ -126,6 +127,7 @@ newsRouter.get("/favorite", authMiddleware, (req, res) => {
     }else{
         return res.status(200).json({
             statusCode: 200,
+            data: [],
             message: `No record found.`
         });
     }
