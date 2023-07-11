@@ -12,6 +12,7 @@ const authMiddleware = require('./middlewares/authMiddleware');
 const preferenceRouter = require('./router/preferenceRouter');
 const jwtMiddleware = require('./middlewares/jwtMiddleware');
 const perfectExpressSanitizer = require('perfect-express-sanitizer');
+const logMiddleware = require("./middlewares/logMiddleware");
 
 const app = express();
 
@@ -44,5 +45,15 @@ app.use("/", userRouter);
 app.use("/preferences", authMiddleware, preferenceRouter);
 
 app.use("/news", jwtMiddleware, newsRouter);
+
+
+app.use((err, req, res, next) => {
+    logMiddleware.error(err.message, err); // Log the error using Winston
+    // Handle the error response
+    res.status(500).json({ 
+        statusCode: 500, 
+        error: 'Internal server error' 
+    });
+});
 
 module.exports = app;
