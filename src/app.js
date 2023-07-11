@@ -4,6 +4,7 @@ require("dotenv").config({ path: envFile });
 
 const express = require("express");
 const bodyParser = require("body-parser");
+const rateLimit = require("express-rate-limit");
 
 const newsRouter = require("./router/newsRouter");
 const userRouter = require("./router/userRouter");
@@ -14,7 +15,22 @@ const perfectExpressSanitizer = require('perfect-express-sanitizer');
 
 const app = express();
 
-app.use(bodyParser.urlencoded({extended: false}));
+let rateLimitter = rateLimit({
+    windowMs: 1 * 60 * 1000, // 1 minutes
+    max: 100,
+    message: {
+        error: {
+            code: 429,
+            message: "Too Many Requests",
+            description: "We're sorry, but you have exceeded the maximum number of requests allowed. Please try again later."
+        }
+    },
+    standardHeaders: true,
+    legacyHeaders: false
+});
+app.use(rateLimitter);
+
+app.use(bodyParser.urlencoded({ extended: false }));
 app.use(bodyParser.json());
 
 app.use(perfectExpressSanitizer.clean({
