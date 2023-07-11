@@ -6,7 +6,8 @@
   "scripts": {
     "dev": "set NODE_ENV=development && nodemon index.js",
     "start": "set NODE_ENV=development && index.js",
-    "test": "set NODE_ENV=test&& mocha tests/**/*.test.js --exit"
+    "test": "set NODE_ENV=test&& mocha tests/**/*.test.js --exit",    
+    "coverage": "nyc --reporter=html npm run test"
   },
   "author": "Arun Singh",
   "license": "ISC",
@@ -27,6 +28,7 @@
     "chai-http": "^4.4.0",
     "mocha": "^10.2.0",
     "nodemon": "^2.0.22",
+    "nyc": "^15.1.0",
     "sinon": "^15.2.0"
   }
 }
