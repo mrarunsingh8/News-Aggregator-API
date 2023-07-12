@@ -31,12 +31,6 @@ Start the server for development mode
   npm run dev
 ```
 
-
-To run the test cases
-
-```bash
-  npm run test
-```
 It will start a server for development use with url http://localhost:3000/.
 
 Start the server production mode
@@ -45,6 +39,20 @@ Start the server production mode
   npm run start
 ```
 It will start a server for production use.
+
+
+To run the test cases
+
+```bash
+  npm run test
+```
+
+To generate the HTML coverage report
+
+```bash
+  npm run coverage
+```
+After complete this command, Go inside the `./coverage` directory and click over the `index.html` to get the coverage report on the browser.
 
 
 ## API Reference
