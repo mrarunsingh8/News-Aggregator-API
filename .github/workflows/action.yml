@@ -6,7 +6,7 @@ on:
       max_prs:
         description: Maximum remediation PRs to create (blank uses VULNERABILITY_MAX_PRS or 3)
         required: false
-        default: "3"
+        default: ""
   schedule:
     # Every weekday at 06:15 UTC. Adjust to your vulnerability-response SLA.
     - cron: '15 6 * * 1-5'
@@ -16,7 +16,7 @@ permissions:
   contents: write
   pull-requests: write
 
-# Each execution creates at most one PR. Queue runs instead of cancelling them
+# Each execution creates a small, configurable PR batch. Queue runs instead of cancelling them
 # so a newly published advisory is considered after an in-progress remediation.
 concurrency:
   group: npm-audit-remediation-${{ github.repository }}
@@ -24,7 +24,7 @@ concurrency:
 
 jobs:
   remediate:
-    name: Create one npm-audit remediation PR
+    name: Create npm-audit remediation PRs
     runs-on: ubuntu-latest
 
     steps:

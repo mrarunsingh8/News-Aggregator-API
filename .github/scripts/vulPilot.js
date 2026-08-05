@@ -35,7 +35,7 @@ const { spawnSync } = require('node:child_process');
 
 const API_VERSION = '2022-11-28';
 const BRANCH_ROOT = 'security-remediation';
-const dryRun = process.env.REMEDIATION_DRY_RUN === 'true';
+const dryRun = process.env.REMEDIATION_DRY_RUN === 'true' || process.env.DRY_RUN === 'true';
 let cachedSemver;
 
 function repositoryFromOrigin() {
@@ -306,6 +306,7 @@ function selectCandidates(manifest, report, plan, requestedPackage) {
       const directOrder = Number(Boolean(right.isDirect)) - Number(Boolean(left.isDirect));
       return directOrder || severityRank(right.severity) - severityRank(left.severity) || a.localeCompare(b);
     });
+  const candidates = [];
   const reasons = [];
   for (const packageName of names) {
     const vulnerability = report.vulnerabilities?.[packageName];
@@ -315,6 +316,10 @@ function selectCandidates(manifest, report, plan, requestedPackage) {
     }
     if (plan?.package && plan.package !== packageName) continue;
     try {
+      // Confirm this candidate has a safe strategy now, but keep only its
+      // immutable audit details. The actual change is rebuilt on a fresh base
+      // branch immediately before the PR is created.
+      selectChange(JSON.parse(JSON.stringify(manifest)), packageName, vulnerability, plan);
       candidates.push({
         packageName,
         vulnerability,
@@ -427,7 +432,7 @@ async function main() {
   const plan = parsePlan();
   const candidates = selectCandidates(manifest, before, plan, requestedPackage);
   const limit = maxPullRequests();
-  const base = process.env.REMEDIATION_BASE || process.env.GITHUB_REF_NAME || 'main';
+  const base = process.env.REMEDIATION_BASE || process.env.BASE_BRANCH || process.env.GITHUB_REF_NAME || 'main';
 
   // GitHub creates this short-lived token for each Actions job. It is not a
   // user-managed secret and the script never reads a token from configuration.
