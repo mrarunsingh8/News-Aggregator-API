@@ -157,10 +157,15 @@ function availableFix(vulnerability) {
 function lockedVersion(packageName) {
   const lockfile = readJson('package-lock.json');
   const packageEntry = lockfile.packages?.[`node_modules/${packageName}`];
-  return packageEntry?.version || lockfile.dependencies?.[packageName]?.version || null;
+  if (packageEntry?.version || lockfile.dependencies?.[packageName]?.version) {
+    return packageEntry?.version || lockfile.dependencies?.[packageName]?.version;
+  }
+  const nested = Object.entries(lockfile.packages || {})
+    .find(([path, entry]) => path.endsWith(`/node_modules/${packageName}`) && entry?.version);
+  return nested?.[1]?.version || null;
 }
 
-function fixedVersionFromRegistry(packageName, declaredRange, vulnerability) {
+function fixedVersionFromRegistry(packageName, declaredRange, vulnerability, { allowMajor = false } = {}) {
   const semver = semverLibrary();
   const current = lockedVersion(packageName) || semver.minVersion(declaredRange)?.version;
   if (!current || !semver.valid(current)) return null;
@@ -181,9 +186,9 @@ function fixedVersionFromRegistry(packageName, declaredRange, vulnerability) {
   }
   const candidates = (Array.isArray(versions) ? versions : [versions])
     .filter((version) => semver.valid(version) && !semver.prerelease(version))
-    .filter((version) => semver.major(version) === currentMajor)
+    .filter((version) => allowMajor || semver.major(version) === currentMajor)
     // In 0.x, a minor bump can be breaking, so preserve the current minor too.
-    .filter((version) => currentMajor !== 0 || semver.minor(version) === currentMinor)
+    .filter((version) => allowMajor || currentMajor !== 0 || semver.minor(version) === currentMinor)
     .filter((version) => semver.gte(version, current))
     .filter((version) => ranges.every((range) => !semver.satisfies(version, range)))
     .sort(semver.compare);
@@ -195,6 +200,50 @@ function dependencySection(manifest, name) {
     if (manifest[section] && Object.hasOwn(manifest[section], name)) return section;
   }
   return null;
+}
+
+function directDependencyNames(manifest) {
+  return new Set(['dependencies', 'devDependencies', 'optionalDependencies', 'peerDependencies']
+    .flatMap((section) => Object.keys(manifest[section] || {})));
+}
+
+function packageNamesInLockPath(packagePath) {
+  const parts = packagePath.split('/');
+  const names = [];
+  for (let index = 0; index < parts.length; index += 1) {
+    if (parts[index] !== 'node_modules' || !parts[index + 1]) continue;
+    index += 1;
+    if (parts[index].startsWith('@') && parts[index + 1]) {
+      names.push(`${parts[index]}/${parts[index + 1]}`);
+      index += 1;
+    } else {
+      names.push(parts[index]);
+    }
+  }
+  return names;
+}
+
+function topParent(manifest, packageName, vulnerability) {
+  const directNames = directDependencyNames(manifest);
+  const auditCandidates = [availableFix(vulnerability)?.name, ...(vulnerability.effects || [])];
+  const fromAudit = auditCandidates.find((name) => name !== packageName && directNames.has(name));
+  if (fromAudit) return fromAudit;
+
+  const lockfile = readJson('package-lock.json');
+  for (const path of Object.keys(lockfile.packages || {})) {
+    const names = packageNamesInLockPath(path);
+    if (names.at(-1) !== packageName) continue;
+    const parent = names.slice(0, -1).find((name) => directNames.has(name));
+    if (parent) return parent;
+  }
+  return null;
+}
+
+function isMajorUpgrade(packageName, oldRange, newVersion) {
+  const semver = semverLibrary();
+  const current = lockedVersion(packageName) || semver.minVersion(oldRange)?.version;
+  return Boolean(current && semver.valid(current) && semver.valid(newVersion)
+    && semver.major(newVersion) > semver.major(current));
 }
 
 function packageSlug(name) {
@@ -221,51 +270,43 @@ function selectChange(manifest, packageName, vulnerability, plan) {
   const directSection = dependencySection(manifest, packageName);
   const auditFixedVersion = fixedVersionFromAudit(vulnerability, packageName);
   const fix = availableFix(vulnerability);
+  const parentName = plan?.parent?.name || (typeof plan?.parent === 'string' ? plan.parent : topParent(manifest, packageName, vulnerability));
+  const parentSection = parentName && dependencySection(manifest, parentName);
+  const fixedVersion = plan?.fixedVersion || auditFixedVersion
+    || fixedVersionFromRegistry(packageName, directSection ? manifest[directSection][packageName] : '*', vulnerability, { allowMajor: true });
 
-  // A direct package can also exist below a direct parent. When npm audit has
-  // identified a compatible parent update, prefer it: this fixes both the
-  // root resolution and copies nested below that parent. Updating only the
-  // root package would otherwise leave the nested vulnerable copy in place.
-  if (!plan && fix?.name && fix.name !== packageName && fix.version && !fix.isSemVerMajor) {
-    const parentSection = dependencySection(manifest, fix.name);
-    if (parentSection) {
+  // For a nested finding, npm audit's parent fix is the least-invasive repair.
+  if (!plan && fix?.name && fix.name !== packageName && fix.version) {
+    const fixedParentSection = dependencySection(manifest, fix.name);
+    if (fixedParentSection) {
       return {
         type: 'transitive-bump', vulnerablePackage: packageName, changedPackage: fix.name,
-        oldRange: manifest[parentSection][fix.name], newVersion: fix.version,
-        apply() { manifest[parentSection][fix.name] = fix.version; },
+        oldRange: manifest[fixedParentSection][fix.name], newVersion: fix.version,
+        requiresCompatibility: isMajorUpgrade(fix.name, manifest[fixedParentSection][fix.name], fix.version),
+        apply() { manifest[fixedParentSection][fix.name] = fix.version; },
       };
     }
   }
 
-  if (directSection) {
-    if (fix?.isSemVerMajor && !plan?.allowBreaking) {
-      throw new Error(`The npm audit fix for ${packageName} is a major-version upgrade; it needs manual migration review.`);
-    }
-    const fixedVersion = plan?.fixedVersion
-      || auditFixedVersion
-      || fixedVersionFromRegistry(packageName, manifest[directSection][packageName], vulnerability);
-    if (!fixedVersion) {
-      throw new Error(`Could not determine a non-breaking fixed version for ${packageName}. Supply REMEDIATION_PLAN.fixedVersion after reviewing its migration impact.`);
-    }
+  if (directSection && !parentSection) {
+    if (!fixedVersion) throw new Error(`No fixed version is available for ${packageName}.`);
     return {
       type: 'direct', vulnerablePackage: packageName, changedPackage: packageName,
       oldRange: manifest[directSection][packageName], newVersion: fixedVersion,
+      requiresCompatibility: isMajorUpgrade(packageName, manifest[directSection][packageName], fixedVersion),
       apply() { manifest[directSection][packageName] = fixedVersion; },
     };
   }
 
   if (plan?.strategy === 'transitive-bump') {
     const parent = plan.parent;
-    if (!parent?.name || !parent?.version) {
-      throw new Error('transitive-bump requires REMEDIATION_PLAN.parent.name and parent.version.');
-    }
-    const parentSection = dependencySection(manifest, parent.name);
-    if (!parentSection) {
-      throw new Error(`${parent.name} is not a direct dependency; refusing to bump a non-direct parent.`);
+    if (!parent?.name || !parent?.version || !parentSection) {
+      throw new Error('transitive-bump requires a direct REMEDIATION_PLAN.parent with name and version.');
     }
     return {
       type: 'transitive-bump', vulnerablePackage: packageName, changedPackage: parent.name,
       oldRange: manifest[parentSection][parent.name], newVersion: parent.version,
+      requiresCompatibility: isMajorUpgrade(parent.name, manifest[parentSection][parent.name], parent.version),
       apply() { manifest[parentSection][parent.name] = parent.version; },
     };
   }
@@ -273,28 +314,19 @@ function selectChange(manifest, packageName, vulnerability, plan) {
   if (plan?.strategy && plan.strategy !== 'transitive-override') {
     throw new Error(`Unsupported remediation strategy: ${plan.strategy}`);
   }
+  if (!fixedVersion) throw new Error(`No fixed version is available for nested ${packageName}.`);
 
-  // npm audit occasionally identifies a safe direct parent upgrade for a
-  // transitive issue. Use it only when that parent is declared directly and
-  // npm confirms it is not a major-version change.
-  if (!plan && fix?.name && fix?.version && !fix.isSemVerMajor) {
-    const parentSection = dependencySection(manifest, fix.name);
-    if (parentSection) {
-      return {
-        type: 'transitive-bump', vulnerablePackage: packageName, changedPackage: fix.name,
-        oldRange: manifest[parentSection][fix.name], newVersion: fix.version,
-        apply() { manifest[parentSection][fix.name] = fix.version; },
-      };
-    }
-  }
-  const fixedVersion = plan?.fixedVersion || auditFixedVersion;
-  if (!fixedVersion) {
-    throw new Error(`A transitive override needs REMEDIATION_PLAN.fixedVersion for ${packageName}.`);
-  }
+  // No compatible parent upgrade was identified. Scope the override to the
+  // top-level parent that introduces the package. When the same package is
+  // also direct, update it in the manifest as well.
   return {
     type: 'transitive-override', vulnerablePackage: packageName, changedPackage: packageName,
-    oldRange: 'transitive', newVersion: fixedVersion, parent: plan?.parent,
-    apply() { setOverride(manifest, packageName, fixedVersion, plan?.parent); },
+    oldRange: directSection ? manifest[directSection][packageName] : 'transitive', newVersion: fixedVersion,
+    parent: parentName, requiresCompatibility: isMajorUpgrade(packageName, directSection ? manifest[directSection][packageName] : '*', fixedVersion),
+    apply() {
+      if (directSection) manifest[directSection][packageName] = fixedVersion;
+      setOverride(manifest, packageName, fixedVersion, parentName);
+    },
   };
 }
 
@@ -426,7 +458,11 @@ function validate(change) {
   if (after.vulnerabilities?.[change.vulnerablePackage]) {
     throw new Error(`npm audit still reports ${change.vulnerablePackage}; refusing to create a PR.`);
   }
-  for (const command of (process.env.REMEDIATION_VALIDATION || '').split('\n').map((item) => item.trim()).filter(Boolean)) {
+  const commands = (process.env.REMEDIATION_VALIDATION || '').split('\n').map((item) => item.trim()).filter(Boolean);
+  if (change.requiresCompatibility && !commands.length) {
+    throw new Error(`Major upgrade for ${change.changedPackage} needs REMEDIATION_VALIDATION (for example: npm test, npm run lint, npm run build).`);
+  }
+  for (const command of commands) {
     runShell(command);
   }
 }
