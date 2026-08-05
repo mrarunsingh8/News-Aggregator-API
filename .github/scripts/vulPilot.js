@@ -222,6 +222,21 @@ function selectChange(manifest, packageName, vulnerability, plan) {
   const auditFixedVersion = fixedVersionFromAudit(vulnerability, packageName);
   const fix = availableFix(vulnerability);
 
+  // A direct package can also exist below a direct parent. When npm audit has
+  // identified a compatible parent update, prefer it: this fixes both the
+  // root resolution and copies nested below that parent. Updating only the
+  // root package would otherwise leave the nested vulnerable copy in place.
+  if (!plan && fix?.name && fix.name !== packageName && fix.version && !fix.isSemVerMajor) {
+    const parentSection = dependencySection(manifest, fix.name);
+    if (parentSection) {
+      return {
+        type: 'transitive-bump', vulnerablePackage: packageName, changedPackage: fix.name,
+        oldRange: manifest[parentSection][fix.name], newVersion: fix.version,
+        apply() { manifest[parentSection][fix.name] = fix.version; },
+      };
+    }
+  }
+
   if (directSection) {
     if (fix?.isSemVerMajor && !plan?.allowBreaking) {
       throw new Error(`The npm audit fix for ${packageName} is a major-version upgrade; it needs manual migration review.`);
@@ -416,6 +431,12 @@ function validate(change) {
   }
 }
 
+function restoreBaseFiles(base) {
+  // Called only after validation fails, before any commit or push.
+  run('git', ['restore', '--source', base, '--staged', '--worktree', 'package.json', 'package-lock.json']);
+  run('git', ['checkout', base]);
+}
+
 async function main() {
   const repository = repositoryName();
   const requestedPackage = process.env.VULNERABILITY_PACKAGE;
@@ -471,7 +492,14 @@ async function main() {
     const change = selectChange(workingManifest, candidate.packageName, candidate.vulnerability, plan);
     change.apply();
     writeJson('package.json', workingManifest);
-    validate(change);
+    try {
+      validate(change);
+    } catch (error) {
+      restoreBaseFiles(base);
+      skipped += 1;
+      console.log(`Skipping ${candidate.packageName}: candidate did not fully remove the audit finding (${error.message}).`);
+      continue;
+    }
 
     run('git', ['config', 'user.name', 'github-actions[bot]']);
     run('git', ['config', 'user.email', '41898282+github-actions[bot]@users.noreply.github.com']);
