@@ -1,0 +1,48 @@
+name: NPM vulnerability remediation
+
+on:
+  workflow_dispatch:
+  schedule:
+    # Every weekday at 06:15 UTC. Adjust to your vulnerability-response SLA.
+    - cron: '15 6 * * 1-5'
+
+# This workflow can create branches and pull requests, but it never merges them.
+permissions:
+  contents: write
+  pull-requests: write
+
+# Each execution creates at most one PR. Queue runs instead of cancelling them
+# so a newly published advisory is considered after an in-progress remediation.
+concurrency:
+  group: npm-audit-remediation-${{ github.repository }}
+  cancel-in-progress: false
+
+jobs:
+  remediate:
+    name: Create one npm-audit remediation PR
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out the default branch
+        uses: actions/checkout@v5
+        with:
+          ref: ${{ github.event.repository.default_branch || github.ref }}
+          fetch-depth: 0
+          persist-credentials: true
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v5
+        with:
+          node-version: 24
+          cache: npm
+
+      - name: Find and remediate one vulnerability
+        run: node .github/scripts/vulPilot.js
+        env:
+          # GitHub creates this short-lived token for the job. It is used only
+          # to look for an existing PR and to create a new one.
+          GITHUB_TOKEN: ${{ github.token }}
+          REMEDIATION_BASE: ${{ github.event.repository.default_branch || github.ref_name }}
+          # Optional repository variable; separate commands with newlines.
+          # Example: npm test\nnpm run lint\nnpm run build
+          REMEDIATION_VALIDATION: ${{ vars.REMEDIATION_VALIDATION }}
