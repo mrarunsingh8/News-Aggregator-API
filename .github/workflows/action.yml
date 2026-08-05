@@ -2,6 +2,11 @@ name: NPM vulnerability remediation
 
 on:
   workflow_dispatch:
+    inputs:
+      max_prs:
+        description: Maximum remediation PRs to create (blank uses VULNERABILITY_MAX_PRS or 3)
+        required: false
+        default: "3"
   schedule:
     # Every weekday at 06:15 UTC. Adjust to your vulnerability-response SLA.
     - cron: '15 6 * * 1-5'
@@ -47,6 +52,7 @@ jobs:
           GITHUB_TOKEN: ${{ github.token }}
           GITHUB_REPOSITORY: ${{ github.repository }}
           REMEDIATION_BASE: ${{ github.event.repository.default_branch || github.ref_name }}
+          MAX_PRS: ${{ github.event.inputs.max_prs || vars.VULNERABILITY_MAX_PRS || '3' }}
           # Optional repository variable; separate commands with newlines.
           # Example: npm test\nnpm run lint\nnpm run build
           REMEDIATION_VALIDATION: ${{ vars.REMEDIATION_VALIDATION }}

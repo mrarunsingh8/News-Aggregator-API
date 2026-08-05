@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 /*
- * Creates one pull request for one npm-audit vulnerability.
+ * Creates remediation pull requests for npm-audit vulnerabilities.
  *
  * This is deliberately PR-only: it never merges, approves, enables
  * auto-merge, or changes the status of an external vulnerability service.
@@ -15,6 +15,7 @@
  *                            selects one safe candidate from npm audit itself
  *   REMEDIATION_BASE         PR base branch (default: GITHUB_REF_NAME, then main)
  *   REMEDIATION_DRY_RUN      "true" skips branch/PR creation
+ *   MAX_PRS                  maximum remediation PRs to create (default: 3)
  *   REMEDIATION_VALIDATION   newline-separated commands, e.g. "npm test\nnpm run lint"
  *   REMEDIATION_PLAN         required for transitive remediations, for example:
  *                            {"package":"qs","strategy":"transitive-bump","parent":{"name":"body-parser","version":"1.20.3"}}
@@ -286,7 +287,17 @@ function severityRank(severity) {
   return { critical: 4, high: 3, moderate: 2, medium: 2, low: 1, info: 0 }[severity] ?? -1;
 }
 
-function selectCandidate(manifest, report, plan, requestedPackage) {
+function maxPullRequests() {
+  const raw = process.env.MAX_PRS || process.env.MAX_REMEDIATIONS || '3';
+  if (!/^\d+$/.test(raw) || Number(raw) < 1) {
+    throw new Error('MAX_PRS must be a positive integer.');
+  }
+  // A small cap prevents one scheduled run from unexpectedly creating a large
+  // number of review requests if a new advisory feed is published.
+  return Math.min(Number(raw), 20);
+}
+
+function selectCandidates(manifest, report, plan, requestedPackage) {
   const names = requestedPackage
     ? [requestedPackage]
     : Object.keys(report.vulnerabilities || {}).sort((a, b) => {
@@ -304,17 +315,19 @@ function selectCandidate(manifest, report, plan, requestedPackage) {
     }
     if (plan?.package && plan.package !== packageName) continue;
     try {
-      return {
+      candidates.push({
         packageName,
         vulnerability,
         advisory: advisoryDetails(vulnerability, packageName),
-        change: selectChange(manifest, packageName, vulnerability, plan),
-      };
+      });
     } catch (error) {
       reasons.push(`${packageName}: ${error.message}`);
     }
   }
-  throw new Error(`npm audit found no safely remediable vulnerability for this run. ${reasons.join(' | ')}`);
+  if (!candidates.length) {
+    throw new Error(`npm audit found no safely remediable vulnerability for this run. ${reasons.join(' | ')}`);
+  }
+  return candidates;
 }
 
 function branchName(change, advisory) {
@@ -366,6 +379,26 @@ async function api(token, path, options = {}) {
   return response.status === 204 ? null : response.json();
 }
 
+async function openPullRequests(token, repository) {
+  const pulls = [];
+  for (let page = 1; ; page += 1) {
+    const pageItems = await api(token, `/repos/${repository}/pulls?state=open&per_page=100&page=${page}`);
+    pulls.push(...pageItems);
+    if (pageItems.length < 100) return pulls;
+  }
+}
+
+function hasOpenRemediation(pulls, branch, candidate) {
+  const advisoryId = candidate.advisory.id;
+  const packageName = candidate.packageName;
+  return pulls.find((pull) => {
+    if (pull.head?.ref === branch) return true;
+    const text = `${pull.title || ''}\n${pull.body || ''}`;
+    return text.includes(advisoryId)
+      && (text.includes(`Affected package: \`${packageName}\``) || text.includes(packageName));
+  });
+}
+
 function validate(change) {
   run('npm', ['install', '--package-lock-only', '--ignore-scripts']);
   run('npm', ['ci', '--ignore-scripts']);
@@ -391,20 +424,10 @@ async function main() {
     console.log('npm audit found no vulnerabilities. Nothing to remediate.');
     return;
   }
-  const candidate = selectCandidate(manifest, before, parsePlan(), requestedPackage);
-  const { advisory, change } = candidate;
-  const branch = branchName(change, advisory);
+  const plan = parsePlan();
+  const candidates = selectCandidates(manifest, before, plan, requestedPackage);
+  const limit = maxPullRequests();
   const base = process.env.REMEDIATION_BASE || process.env.GITHUB_REF_NAME || 'main';
-  const owner = repository.split('/')[0];
-
-  change.apply();
-  writeJson('package.json', manifest);
-  validate(change);
-
-  if (dryRun) {
-    console.log(`Dry run complete. Would create ${branch} and a PR against ${base}.`);
-    return;
-  }
 
   // GitHub creates this short-lived token for each Actions job. It is not a
   // user-managed secret and the script never reads a token from configuration.
@@ -412,24 +435,54 @@ async function main() {
   if (!token) {
     throw new Error('No Actions token is available. Expose the job token as GITHUB_TOKEN for this Node step.');
   }
-  const openPulls = await api(token, `/repos/${repository}/pulls?state=open&head=${encodeURIComponent(`${owner}:${branch}`)}`);
-  if (openPulls.length) {
-    console.log(`An open remediation PR already exists: ${openPulls[0].html_url}`);
-    return;
+  const pulls = await openPullRequests(token, repository);
+  let created = 0;
+  let skipped = 0;
+
+  for (const candidate of candidates) {
+    if (created >= limit) break;
+    // Preview the exact strategy before creating a branch. selectChange only
+    // mutates its supplied manifest when apply() is called.
+    const preview = JSON.parse(JSON.stringify(manifest));
+    const previewChange = selectChange(preview, candidate.packageName, candidate.vulnerability, plan);
+    const branch = branchName(previewChange, candidate.advisory);
+    const existing = hasOpenRemediation(pulls, branch, candidate);
+    if (existing) {
+      skipped += 1;
+      console.log(`Skipping ${candidate.packageName}: remediation PR already open: ${existing.html_url}`);
+      continue;
+    }
+
+    if (dryRun) {
+      created += 1;
+      console.log(`Dry run: would create ${branch} for ${candidate.packageName} against ${base}.`);
+      continue;
+    }
+
+    // Every PR begins from the same base branch; changes from one vulnerability
+    // never leak into another remediation PR.
+    run('git', ['checkout', '-B', branch, base]);
+    const workingManifest = readJson('package.json');
+    const change = selectChange(workingManifest, candidate.packageName, candidate.vulnerability, plan);
+    change.apply();
+    writeJson('package.json', workingManifest);
+    validate(change);
+
+    run('git', ['config', 'user.name', 'github-actions[bot]']);
+    run('git', ['config', 'user.email', '41898282+github-actions[bot]@users.noreply.github.com']);
+    run('git', ['add', '--', 'package.json', 'package-lock.json']);
+    run('git', ['commit', '-m', prTitle(change, candidate.advisory)]);
+    run('git', ['push', '--force-with-lease', 'origin', branch]);
+
+    const pull = await api(token, `/repos/${repository}/pulls`, {
+      method: 'POST',
+      body: { title: prTitle(change, candidate.advisory), head: branch, base, body: prBody(change, candidate.advisory) },
+    });
+    pulls.push(pull);
+    created += 1;
+    console.log(`Created PR: ${pull.html_url}`);
   }
-
-  run('git', ['checkout', '-B', branch]);
-  run('git', ['config', 'user.name', 'github-actions[bot]']);
-  run('git', ['config', 'user.email', '41898282+github-actions[bot]@users.noreply.github.com']);
-  run('git', ['add', '--', 'package.json', 'package-lock.json']);
-  run('git', ['commit', '-m', prTitle(change, advisory)]);
-  run('git', ['push', '--force-with-lease', 'origin', branch]);
-
-  const pull = await api(token, `/repos/${repository}/pulls`, {
-    method: 'POST',
-    body: { title: prTitle(change, advisory), head: branch, base, body: prBody(change, advisory) },
-  });
-  console.log(`Created PR: ${pull.html_url}`);
+  console.log(`Remediation run complete: ${created} ${dryRun ? 'planned' : 'created'}, ${skipped} skipped, limit ${limit}.`);
 }
 
 main().catch((error) => {
