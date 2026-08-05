@@ -32,7 +32,6 @@
 const { existsSync, readFileSync, writeFileSync } = require('node:fs');
 const { spawnSync } = require('node:child_process');
 
-const GITHUB_REPOSITORY="https://github.com/mrarunsingh8/News-Aggregator-API";
 const API_VERSION = '2022-11-28';
 const BRANCH_ROOT = 'security-remediation';
 const dryRun = process.env.REMEDIATION_DRY_RUN === 'true';

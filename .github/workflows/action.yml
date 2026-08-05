@@ -42,6 +42,7 @@ jobs:
           # GitHub creates this short-lived token for the job. It is used only
           # to look for an existing PR and to create a new one.
           GITHUB_TOKEN: ${{ github.token }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
           REMEDIATION_BASE: ${{ github.event.repository.default_branch || github.ref_name }}
           # Optional repository variable; separate commands with newlines.
           # Example: npm test\nnpm run lint\nnpm run build
