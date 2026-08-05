@@ -202,6 +202,17 @@ function dependencySection(manifest, name) {
   return null;
 }
 
+function latestParentUpgrade(packageName, declaredRange) {
+  const semver = semverLibrary();
+  const current = lockedVersion(packageName) || semver.minVersion(declaredRange)?.version;
+  if (!current || !semver.valid(current)) return null;
+  const output = run('npm', ['view', packageName, 'versions', '--json'], { capture: true });
+  const versions = JSON.parse(output);
+  return (Array.isArray(versions) ? versions : [versions])
+    .filter((version) => semver.valid(version) && !semver.prerelease(version) && semver.gt(version, current))
+    .sort(semver.rcompare)[0] || null;
+}
+
 function directDependencyNames(manifest) {
   return new Set(['dependencies', 'devDependencies', 'optionalDependencies', 'peerDependencies']
     .flatMap((section) => Object.keys(manifest[section] || {})));
@@ -284,6 +295,18 @@ function selectChange(manifest, packageName, vulnerability, plan) {
         oldRange: manifest[fixedParentSection][fix.name], newVersion: fix.version,
         requiresCompatibility: isMajorUpgrade(fix.name, manifest[fixedParentSection][fix.name], fix.version),
         apply() { manifest[fixedParentSection][fix.name] = fix.version; },
+      };
+    }
+  }
+
+  if (!plan && !directSection && parentName && parentSection) {
+    const targetVersion = latestParentUpgrade(parentName, manifest[parentSection][parentName]);
+    if (targetVersion) {
+      return {
+        type: 'transitive-bump', vulnerablePackage: packageName, changedPackage: parentName,
+        oldRange: manifest[parentSection][parentName], newVersion: targetVersion,
+        requiresCompatibility: isMajorUpgrade(parentName, manifest[parentSection][parentName], targetVersion),
+        apply() { manifest[parentSection][parentName] = `^${targetVersion}`; },
       };
     }
   }
