@@ -1,1068 +1,439 @@
 #!/usr/bin/env node
+/*
+ * Creates one pull request for one npm-audit vulnerability.
+ *
+ * This is deliberately PR-only: it never merges, approves, enables
+ * auto-merge, or changes the status of an external vulnerability service.
+ * The vulnerability source of truth is the local
+ * `npm audit --json` report generated from the checked-out package-lock.json.
+ *
+ * `GITHUB_REPOSITORY` is used when available; otherwise the script derives
+ * owner/repository from the origin remote.
+ *
+ * Optional environment:
+ *   VULNERABILITY_PACKAGE    limits a run to one package; otherwise the script
+ *                            selects one safe candidate from npm audit itself
+ *   REMEDIATION_BASE         PR base branch (default: GITHUB_REF_NAME, then main)
+ *   REMEDIATION_DRY_RUN      "true" skips branch/PR creation
+ *   REMEDIATION_VALIDATION   newline-separated commands, e.g. "npm test\nnpm run lint"
+ *   REMEDIATION_PLAN         required for transitive remediations, for example:
+ *                            {"package":"qs","strategy":"transitive-bump","parent":{"name":"body-parser","version":"1.20.3"}}
+ *                            {"package":"qs","strategy":"transitive-override","fixedVersion":"6.13.5","parent":"body-parser"}
+ *
+ * The script intentionally does not call `npm audit fix` or use `--force`:
+ * either can modify unrelated packages, violating the one-vulnerability-per-PR
+ * contract. When audit does not name a fixed direct version, it queries npm's
+ * registry and uses semver to find the smallest safe version in the current
+ * major line.
+ */
 
-const { spawn } = require("node:child_process");
-const { readFile, writeFile } = require("node:fs/promises");
-const { existsSync } = require("node:fs");
-const path = require("node:path");
+'use strict';
 
-const severityRank = new Map([
-  ["low", 0],
-  ["moderate", 1],
-  ["medium", 1],
-  ["high", 2],
-  ["critical", 3],
-]);
+const { existsSync, readFileSync, writeFileSync } = require('node:fs');
+const { spawnSync } = require('node:child_process');
 
-const root = path.resolve(process.cwd());
-console.log(`Starting vul-pilot in ${root}`);
-const packageJsonPath = `${root}/package.json`;
-const packageLockPath = `${root}/package-lock.json`;
-const githubToken = process.env.PATCH_GITHUB_TOKEN;
-const dryRun = parseBoolean(process.env.DRY_RUN, false);
-const maxPrs = parsePositiveInt(process.env.MAX_PRS, 5);
-const severityThreshold = normalizeSeverity(process.env.SEVERITY_THRESHOLD || "moderate");
-const baseBranch = process.env.BASE_BRANCH || process.env.GITHUB_REF_NAME || "main";
-const repository = process.env.PATCH_GITHUB_REPOSITORY;
+const GITHUB_REPOSITORY="https://github.com/mrarunsingh8/News-Aggregator-API";
+const API_VERSION = '2022-11-28';
+const BRANCH_ROOT = 'security-remediation';
+const dryRun = process.env.REMEDIATION_DRY_RUN === 'true';
+let cachedSemver;
 
-main().catch((error) => {
-  console.error(error?.stack || error);
-  process.exit(1);
-});
+function repositoryFromOrigin() {
+  const result = spawnSync('git', ['config', '--get', 'remote.origin.url'], {
+    cwd: process.cwd(), encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'],
+  });
+  const origin = (result.stdout || '').trim();
+  const match = origin.match(/github\.com[/:]([^/]+\/[^/]+?)(?:\.git)?$/i);
+  if (!match) return null;
+  return match[1];
+}
+
+function repositoryName() {
+  const repository = process.env.GITHUB_REPOSITORY || repositoryFromOrigin();
+  if (!repository) {
+    throw new Error('Cannot determine the repository. Run in GitHub Actions or configure an origin remote such as git@github.com:owner/repository.git.');
+  }
+  return repository;
+}
+
+function run(command, args, options = {}) {
+  console.log(`$ ${[command, ...args].join(' ')}`);
+  const result = spawnSync(command, args, {
+    cwd: process.cwd(),
+    encoding: 'utf8',
+    stdio: options.capture ? ['ignore', 'pipe', 'pipe'] : 'inherit',
+  });
+  if (result.error) throw result.error;
+  if (result.status !== 0) {
+    const detail = options.capture ? `\n${result.stderr || result.stdout || ''}` : '';
+    throw new Error(`${command} failed with exit code ${result.status}.${detail}`);
+  }
+  return result.stdout || '';
+}
+
+function runShell(command) {
+  console.log(`$ ${command}`);
+  const result = spawnSync(command, { cwd: process.cwd(), shell: true, stdio: 'inherit' });
+  if (result.error) throw result.error;
+  if (result.status !== 0) throw new Error(`Validation failed: ${command}`);
+}
+
+function readJson(path) {
+  return JSON.parse(readFileSync(path, 'utf8'));
+}
+
+function semverLibrary() {
+  if (cachedSemver) return cachedSemver;
+  try {
+    cachedSemver = require('semver');
+    return cachedSemver;
+  } catch {
+    // semver is bundled with npm, though it is not normally exposed as a
+    // project dependency. Resolve it from npm's global installation so this
+    // script remains standalone and does not alter package.json.
+    const npmRoot = run('npm', ['root', '-g'], { capture: true }).trim();
+    for (const candidate of [`${npmRoot}/npm/node_modules/semver`, `${npmRoot}/semver`]) {
+      try {
+        cachedSemver = require(candidate);
+        return cachedSemver;
+      } catch {
+        // Try the next known npm layout.
+      }
+    }
+    throw new Error('Unable to load semver from this runner. Install semver for the workflow runtime or provide REMEDIATION_PLAN.fixedVersion.');
+  }
+}
+
+function writeJson(path, value) {
+  writeFileSync(path, `${JSON.stringify(value, null, 2)}\n`);
+}
+
+function parsePlan() {
+  if (!process.env.REMEDIATION_PLAN) return null;
+  try {
+    return JSON.parse(process.env.REMEDIATION_PLAN);
+  } catch (error) {
+    throw new Error(`REMEDIATION_PLAN must be valid JSON: ${error.message}`);
+  }
+}
+
+function auditReport() {
+  const result = spawnSync('npm', ['audit', '--json'], {
+    cwd: process.cwd(), encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'],
+  });
+  try {
+    return JSON.parse(result.stdout || '{}');
+  } catch {
+    throw new Error(`npm audit did not return JSON. ${result.stderr || ''}`);
+  }
+}
+
+function advisoryDetails(vulnerability, packageName) {
+  const details = (vulnerability.via || []).find((item) => typeof item === 'object') || {};
+  const url = details.url || '';
+  const ghsa = url.match(/GHSA-[\w-]+/i)?.[0]?.toUpperCase();
+  const id = ghsa || (details.source ? `npm-${details.source}` : `npm-audit-${packageName}`);
+  return {
+    id,
+    url: url || undefined,
+    title: details.title || `${packageName} vulnerability reported by npm audit`,
+    severity: details.severity || vulnerability.severity || 'unknown',
+    range: details.range || vulnerability.range || 'unknown',
+  };
+}
+
+function fixedVersionFromAudit(vulnerability, packageName) {
+  const fix = vulnerability.fixAvailable;
+  if (fix && typeof fix === 'object' && fix.name === packageName && fix.version) return fix.version;
+  return null;
+}
+
+function availableFix(vulnerability) {
+  return vulnerability.fixAvailable && typeof vulnerability.fixAvailable === 'object'
+    ? vulnerability.fixAvailable
+    : null;
+}
+
+function lockedVersion(packageName) {
+  const lockfile = readJson('package-lock.json');
+  const packageEntry = lockfile.packages?.[`node_modules/${packageName}`];
+  return packageEntry?.version || lockfile.dependencies?.[packageName]?.version || null;
+}
+
+function fixedVersionFromRegistry(packageName, declaredRange, vulnerability) {
+  const semver = semverLibrary();
+  const current = lockedVersion(packageName) || semver.minVersion(declaredRange)?.version;
+  if (!current || !semver.valid(current)) return null;
+  const currentMajor = semver.major(current);
+  const currentMinor = semver.minor(current);
+  const ranges = (vulnerability.via || [])
+    .filter((item) => typeof item === 'object' && item.range)
+    .map((item) => item.range);
+  if (!ranges.length && vulnerability.range) ranges.push(vulnerability.range);
+  if (!ranges.length) return null;
+
+  const output = run('npm', ['view', packageName, 'versions', '--json'], { capture: true });
+  let versions;
+  try {
+    versions = JSON.parse(output);
+  } catch {
+    throw new Error(`npm registry returned invalid version data for ${packageName}.`);
+  }
+  const candidates = (Array.isArray(versions) ? versions : [versions])
+    .filter((version) => semver.valid(version) && !semver.prerelease(version))
+    .filter((version) => semver.major(version) === currentMajor)
+    // In 0.x, a minor bump can be breaking, so preserve the current minor too.
+    .filter((version) => currentMajor !== 0 || semver.minor(version) === currentMinor)
+    .filter((version) => semver.gte(version, current))
+    .filter((version) => ranges.every((range) => !semver.satisfies(version, range)))
+    .sort(semver.compare);
+  return candidates[0] || null;
+}
+
+function dependencySection(manifest, name) {
+  for (const section of ['dependencies', 'devDependencies', 'optionalDependencies', 'peerDependencies']) {
+    if (manifest[section] && Object.hasOwn(manifest[section], name)) return section;
+  }
+  return null;
+}
+
+function packageSlug(name) {
+  return name.replace(/^@/, '').replace(/[^A-Za-z0-9._-]+/g, '-').slice(0, 60);
+}
+
+function quote(value) {
+  return String(value).replace(/`/g, '\\`');
+}
+
+function setOverride(manifest, vulnerablePackage, fixedVersion, parent) {
+  manifest.overrides ||= {};
+  if (!parent) {
+    manifest.overrides[vulnerablePackage] = fixedVersion;
+    return;
+  }
+  if (manifest.overrides[parent] && typeof manifest.overrides[parent] !== 'object') {
+    throw new Error(`Existing override for ${parent} is not an object; cannot scope a new override to it.`);
+  }
+  manifest.overrides[parent] = { ...(manifest.overrides[parent] || {}), [vulnerablePackage]: fixedVersion };
+}
+
+function selectChange(manifest, packageName, vulnerability, plan) {
+  const directSection = dependencySection(manifest, packageName);
+  const auditFixedVersion = fixedVersionFromAudit(vulnerability, packageName);
+  const fix = availableFix(vulnerability);
+
+  if (directSection) {
+    if (fix?.isSemVerMajor && !plan?.allowBreaking) {
+      throw new Error(`The npm audit fix for ${packageName} is a major-version upgrade; it needs manual migration review.`);
+    }
+    const fixedVersion = plan?.fixedVersion
+      || auditFixedVersion
+      || fixedVersionFromRegistry(packageName, manifest[directSection][packageName], vulnerability);
+    if (!fixedVersion) {
+      throw new Error(`Could not determine a non-breaking fixed version for ${packageName}. Supply REMEDIATION_PLAN.fixedVersion after reviewing its migration impact.`);
+    }
+    return {
+      type: 'direct', vulnerablePackage: packageName, changedPackage: packageName,
+      oldRange: manifest[directSection][packageName], newVersion: fixedVersion,
+      apply() { manifest[directSection][packageName] = fixedVersion; },
+    };
+  }
+
+  if (plan?.strategy === 'transitive-bump') {
+    const parent = plan.parent;
+    if (!parent?.name || !parent?.version) {
+      throw new Error('transitive-bump requires REMEDIATION_PLAN.parent.name and parent.version.');
+    }
+    const parentSection = dependencySection(manifest, parent.name);
+    if (!parentSection) {
+      throw new Error(`${parent.name} is not a direct dependency; refusing to bump a non-direct parent.`);
+    }
+    return {
+      type: 'transitive-bump', vulnerablePackage: packageName, changedPackage: parent.name,
+      oldRange: manifest[parentSection][parent.name], newVersion: parent.version,
+      apply() { manifest[parentSection][parent.name] = parent.version; },
+    };
+  }
+
+  if (plan?.strategy && plan.strategy !== 'transitive-override') {
+    throw new Error(`Unsupported remediation strategy: ${plan.strategy}`);
+  }
+
+  // npm audit occasionally identifies a safe direct parent upgrade for a
+  // transitive issue. Use it only when that parent is declared directly and
+  // npm confirms it is not a major-version change.
+  if (!plan && fix?.name && fix?.version && !fix.isSemVerMajor) {
+    const parentSection = dependencySection(manifest, fix.name);
+    if (parentSection) {
+      return {
+        type: 'transitive-bump', vulnerablePackage: packageName, changedPackage: fix.name,
+        oldRange: manifest[parentSection][fix.name], newVersion: fix.version,
+        apply() { manifest[parentSection][fix.name] = fix.version; },
+      };
+    }
+  }
+  const fixedVersion = plan?.fixedVersion || auditFixedVersion;
+  if (!fixedVersion) {
+    throw new Error(`A transitive override needs REMEDIATION_PLAN.fixedVersion for ${packageName}.`);
+  }
+  return {
+    type: 'transitive-override', vulnerablePackage: packageName, changedPackage: packageName,
+    oldRange: 'transitive', newVersion: fixedVersion, parent: plan?.parent,
+    apply() { setOverride(manifest, packageName, fixedVersion, plan?.parent); },
+  };
+}
+
+function severityRank(severity) {
+  return { critical: 4, high: 3, moderate: 2, medium: 2, low: 1, info: 0 }[severity] ?? -1;
+}
+
+function selectCandidate(manifest, report, plan, requestedPackage) {
+  const names = requestedPackage
+    ? [requestedPackage]
+    : Object.keys(report.vulnerabilities || {}).sort((a, b) => {
+      const left = report.vulnerabilities[a];
+      const right = report.vulnerabilities[b];
+      const directOrder = Number(Boolean(right.isDirect)) - Number(Boolean(left.isDirect));
+      return directOrder || severityRank(right.severity) - severityRank(left.severity) || a.localeCompare(b);
+    });
+  const reasons = [];
+  for (const packageName of names) {
+    const vulnerability = report.vulnerabilities?.[packageName];
+    if (!vulnerability) {
+      reasons.push(`${packageName}: not reported by npm audit`);
+      continue;
+    }
+    if (plan?.package && plan.package !== packageName) continue;
+    try {
+      return {
+        packageName,
+        vulnerability,
+        advisory: advisoryDetails(vulnerability, packageName),
+        change: selectChange(manifest, packageName, vulnerability, plan),
+      };
+    } catch (error) {
+      reasons.push(`${packageName}: ${error.message}`);
+    }
+  }
+  throw new Error(`npm audit found no safely remediable vulnerability for this run. ${reasons.join(' | ')}`);
+}
+
+function branchName(change, advisory) {
+  return `${BRANCH_ROOT}/${change.type}/${advisory.id}/${packageSlug(change.vulnerablePackage)}`;
+}
+
+function prTitle(change, advisory) {
+  if (change.type === 'direct') return `security(direct): remediate ${advisory.id} in ${change.changedPackage}`;
+  if (change.type === 'transitive-bump') return `security(transitive): remediate ${advisory.id} via ${change.changedPackage}`;
+  return `security(override): remediate ${advisory.id} in ${change.changedPackage}`;
+}
+
+function prBody(change, advisory) {
+  const lifecycle = change.type === 'transitive-override'
+    ? `\n## Override lifecycle\n- Temporary ${change.parent ? `override scoped to \`${quote(change.parent)}\`` : 'root-level override'}.\n- Remove it once an upstream parent resolves the dependency safely.\n- Review it during the next dependency-maintenance cycle.\n`
+    : '';
+  const source = advisory.url ? `[${advisory.id}](${advisory.url})` : `\`${advisory.id}\``;
+  return `## Vulnerability
+- Source: npm audit
+- Advisory: ${source}
+- Severity: ${advisory.severity}
+- Affected package: \`${quote(change.vulnerablePackage)}\`
+- Vulnerable range: \`${quote(advisory.range)}\`
+- Summary: ${advisory.title}
+
+## Remediation
+- Type: \`${change.type}\`
+- Change: \`${quote(change.changedPackage)}\` from \`${quote(change.oldRange)}\` to \`${quote(change.newVersion)}\`
+- Auto-merge: disabled by design
+
+## Validation
+- [x] Lockfile regenerated with npm
+- [x] npm audit no longer reports the affected package
+- [x] \`npm ci --ignore-scripts\`
+${lifecycle}`;
+}
+
+async function api(token, path, options = {}) {
+  const response = await fetch(`https://api.github.com${path}`, {
+    method: options.method || 'GET',
+    headers: {
+      accept: 'application/vnd.github+json', authorization: `Bearer ${token}`,
+      'x-github-api-version': API_VERSION,
+      ...(options.body ? { 'content-type': 'application/json' } : {}),
+    },
+    body: options.body ? JSON.stringify(options.body) : undefined,
+  });
+  if (!response.ok) throw new Error(`GitHub API ${response.status}: ${await response.text()}`);
+  return response.status === 204 ? null : response.json();
+}
+
+function validate(change) {
+  run('npm', ['install', '--package-lock-only', '--ignore-scripts']);
+  run('npm', ['ci', '--ignore-scripts']);
+  const after = auditReport();
+  if (after.vulnerabilities?.[change.vulnerablePackage]) {
+    throw new Error(`npm audit still reports ${change.vulnerablePackage}; refusing to create a PR.`);
+  }
+  for (const command of (process.env.REMEDIATION_VALIDATION || '').split('\n').map((item) => item.trim()).filter(Boolean)) {
+    runShell(command);
+  }
+}
 
 async function main() {
-  assertRuntime();
+  const repository = repositoryName();
+  const requestedPackage = process.env.VULNERABILITY_PACKAGE;
+  if (!existsSync('package.json') || !existsSync('package-lock.json')) {
+    throw new Error('Run this script from an npm repository root with package.json and package-lock.json.');
+  }
 
-  const packageJson = await readPackageJson();
-  const packageLock = await readPackageLock();
-  await configureGit();
+  const before = auditReport();
+  const manifest = readJson('package.json');
+  if (!Object.keys(before.vulnerabilities || {}).length) {
+    console.log('npm audit found no vulnerabilities. Nothing to remediate.');
+    return;
+  }
+  const candidate = selectCandidate(manifest, before, parsePlan(), requestedPackage);
+  const { advisory, change } = candidate;
+  const branch = branchName(change, advisory);
+  const base = process.env.REMEDIATION_BASE || process.env.GITHUB_REF_NAME || 'main';
+  const owner = repository.split('/')[0];
 
-  const audit = await npmAudit();
-  const advisories = extractAdvisories(audit, packageJson)
-    .filter((item) => severityRank.get(item.severity) >= severityRank.get(severityThreshold))
-    .sort(compareAdvisories);
+  change.apply();
+  writeJson('package.json', manifest);
+  validate(change);
 
-  if (advisories.length === 0) {
-    console.log(`No npm advisories found at or above ${severityThreshold}.`);
+  if (dryRun) {
+    console.log(`Dry run complete. Would create ${branch} and a PR against ${base}.`);
     return;
   }
 
-  console.log(`Found ${advisories.length} advisory candidate(s); attempting up to ${maxPrs}.`);
-
-  let opened = 0;
-  const attempted = new Set();
-
-  for (const advisory of advisories) {
-    if (opened >= maxPrs) break;
-    if (attempted.has(advisory.key)) continue;
-    attempted.add(advisory.key);
-
-    console.log(`\n---\nPlanning remediation for ${advisory.packageName}: ${advisory.title}`);
-
-    const plans = await buildPlans(advisory, packageJson, packageLock);
-    if (plans.length === 0) {
-      console.log(`Skipping ${advisory.key}: no targeted npm remediation could be derived.`);
-      continue;
-    }
-
-    const result = await attemptRemediationPlans(plans, advisory);
-    if (!result.success) {
-      console.log(`Skipping PR for ${advisory.key}: ${result.reason}`);
-      continue;
-    }
-
-    if (dryRun) {
-      console.log(`[dry-run] Would open PR: ${result.title}`);
-      opened += 1;
-      continue;
-    }
-
-    await pushBranch(result.branch);
-    await openOrUpdatePullRequest(result);
-    opened += 1;
+  // GitHub creates this short-lived token for each Actions job. It is not a
+  // user-managed secret and the script never reads a token from configuration.
+  const token = process.env.GITHUB_TOKEN || process.env.GH_TOKEN;
+  if (!token) {
+    throw new Error('No Actions token is available. Expose the job token as GITHUB_TOKEN for this Node step.');
   }
-
-  console.log(`\nCompleted. Opened or updated ${opened} remediation PR(s).`);
-}
-
-async function attemptRemediationPlans(plans, advisory) {
-  let lastFailure = "no remediation plan was attempted";
-
-  for (const plan of plans) {
-    console.log(`Trying ${plan.type}: ${plan.explanation}`);
-    const result = await attemptRemediation(plan, advisory);
-    if (result.success) return result;
-    lastFailure = `${plan.type} failed: ${result.reason}`;
-    console.log(`Plan did not remediate ${advisory.key}: ${lastFailure}`);
-  }
-
-  return { success: false, reason: lastFailure };
-}
-
-function assertRuntime() {
-  if (!existsSync(packageJsonPath)) {
-    throw new Error("package.json was not found. This workflow currently supports npm projects only.");
-  }
-  if (!existsSync(packageLockPath)) {
-    throw new Error("package-lock.json was not found. Commit an npm lockfile before enabling this workflow.");
-  }
-  if (!repository) {
-    throw new Error("GITHUB_REPOSITORY is not set.");
-  }
-  if (!githubToken && !dryRun) {
-    throw new Error("GITHUB_TOKEN is required to open pull requests.");
-  }
-}
-
-async function attemptRemediation(plan, advisory) {
-  const branch = `vulPilot/${slugify(advisory.packageName)}-${slugify(advisory.advisoryId)}`;
-
-  await checkoutBase();
-  await checkoutBranch(branch);
-
-  const beforePackageJson = await readPackageJson();
-  const changed = await applyPlan(plan, beforePackageJson);
-  if (!changed) {
-    return { success: false, reason: "remediation made no package.json change" };
-  }
-
-  await run("npm", ["install", "--package-lock-only", "--ignore-scripts"], {
-    env: { ...process.env, npm_config_audit: "false", npm_config_fund: "false" },
-  });
-
-  const afterAudit = await npmAudit();
-  if (advisoryStillPresent(afterAudit, advisory)) {
-    return { success: false, reason: "target advisory is still present after remediation" };
-  }
-
-  const checks = await runProjectChecks();
-  /* if (!checks.every((check) => check.ok)) {
-    const failed = checks.filter((check) => !check.ok).map((check) => check.name).join(", ");
-    return { success: false, reason: `validation failed: ${failed}` };
-  } */
-
-  const diffSummary = await git(["diff", "--stat"]);
-  const hasChanges = (await git(["status", "--porcelain"])).trim().length > 0;
-  if (!hasChanges) {
-    return { success: false, reason: "no git changes remained after remediation" };
-  }
-
-  const prContent = await buildPullRequestContent({ advisory, plan, checks, diffSummary });
-  await git(["add", "package.json", "package-lock.json"]);
-  await git(["commit", "-m", prContent.title]);
-
-  return {
-    success: true,
-    branch,
-    title: prContent.title,
-    body: prContent.body,
-    advisory,
-    plan,
-    checks,
-  };
-}
-
-async function applyPlan(plan, packageJson) {
-  if (plan.type === "direct-upgrade") {
-    const section = packageJson.dependencies?.[plan.packageName]
-      ? "dependencies"
-      : packageJson.devDependencies?.[plan.packageName]
-        ? "devDependencies"
-        : packageJson.optionalDependencies?.[plan.packageName]
-          ? "optionalDependencies"
-          : null;
-    if (!section) return false;
-    const nextRange = `^${plan.targetVersion}`;
-    if (packageJson[section][plan.packageName] === nextRange) return false;
-    packageJson[section][plan.packageName] = nextRange;
-    await writePackageJson(packageJson);
-    return true;
-  }
-
-  if (plan.type === "parent-upgrade") {
-    const section = packageJson.dependencies?.[plan.parentName]
-      ? "dependencies"
-      : packageJson.devDependencies?.[plan.parentName]
-        ? "devDependencies"
-        : packageJson.optionalDependencies?.[plan.parentName]
-          ? "optionalDependencies"
-          : null;
-    if (!section) return false;
-    const nextRange = `^${plan.targetVersion}`;
-    if (packageJson[section][plan.parentName] === nextRange) return false;
-    packageJson[section][plan.parentName] = nextRange;
-    await writePackageJson(packageJson);
-    return true;
-  }
-
-  if (plan.type === "override") {
-    packageJson.overrides = packageJson.overrides || {};
-    if (packageJson.overrides[plan.packageName] === plan.targetVersion) return false;
-    packageJson.overrides[plan.packageName] = plan.targetVersion;
-    await writePackageJson(packageJson);
-    return true;
-  }
-
-  return false;
-}
-
-async function buildPlans(advisory, packageJson, packageLock) {
-  if (advisory.isDirect) {
-    return compactPlans([await buildDirectDependencyPlan(advisory, packageJson, packageLock)]);
-  }
-
-  return buildNestedDependencyPlan(advisory, packageJson, packageLock);
-}
-
-async function buildDirectDependencyPlan(advisory, packageJson, packageLock) {
-  const fix = advisory.fixAvailable;
-  let targetVersion = null;
-
-  if (fix && fix !== true && fix.name === advisory.packageName && !Boolean(fix.isSemVerMajor)) {
-    targetVersion = cleanVersion(fix.version);
-  }
-
-  if (!targetVersion) {
-    targetVersion = await getLowestSafeSameMajorVersion(
-      advisory.packageName,
-      findDirectOrInstalledVersion(advisory.packageName, packageJson, packageLock),
-      advisory.range,
-    );
-  }
-
-  if (!targetVersion) {
-    targetVersion = await getLatestSameMajorDirectVersion(advisory.packageName, packageJson, packageLock);
-  }
-
-  if (!targetVersion || !isSameMajorDirectBump(advisory.packageName, targetVersion, packageJson)) return null;
-
-  return {
-    type: "direct-upgrade",
-    packageName: advisory.packageName,
-    targetVersion,
-    isSemVerMajor: false,
-    explanation: `Upgrade direct dependency ${advisory.packageName} to ${targetVersion}.`,
-  };
-}
-
-function compactPlans(plans) {
-  return plans.filter(Boolean);
-}
-
-async function buildNestedDependencyPlan(advisory, packageJson, packageLock) {
-  const parentPlan = await buildTopParentBumpPlan(advisory, packageJson, packageLock);
-  const overridePlan = await buildOverridePlan(advisory, packageLock);
-
-  return compactPlans([
-    parentPlan && !parentPlan.isSemVerMajor && isSameMajorParentBump(parentPlan, packageJson)
-      ? parentPlan
-      : null,
-    overridePlan,
-  ]);
-}
-
-async function buildTopParentBumpPlan(advisory, packageJson, packageLock) {
-  const fix = advisory.fixAvailable;
-  const topParent = findTopDirectParent(advisory, packageJson, packageLock);
-  if (!topParent) return null;
-
-  if (fix && fix !== true && fix.name === topParent) {
-    const targetVersion = cleanVersion(fix.version);
-    if (!targetVersion) return null;
-
-    return {
-      type: "parent-upgrade",
-      packageName: advisory.packageName,
-      parentName: topParent,
-      targetVersion,
-      isSemVerMajor: Boolean(fix.isSemVerMajor),
-      explanation: `Upgrade top-level parent dependency ${topParent} to ${targetVersion} to remediate nested vulnerability in ${advisory.packageName}.`,
-    };
-  }
-
-  const targetVersion = await getLatestSameMajorVersion(topParent, packageJson);
-  if (!targetVersion) return null;
-
-  return {
-    type: "parent-upgrade",
-    packageName: advisory.packageName,
-    parentName: topParent,
-    targetVersion,
-    isSemVerMajor: false,
-    explanation: `Upgrade top-level parent dependency ${topParent} to ${targetVersion} to remediate nested vulnerability in ${advisory.packageName}.`,
-  };
-}
-
-async function buildOverridePlan(advisory, packageLock) {
-  const targetVersion = await getOverrideTargetVersion(advisory, packageLock);
-  if (!targetVersion) return null;
-
-  return {
-    type: "override",
-    packageName: advisory.packageName,
-    targetVersion,
-    isSemVerMajor: false,
-    explanation: `Apply npm override for nested dependency ${advisory.packageName}@${targetVersion}.`,
-  };
-}
-
-async function getOverrideTargetVersion(advisory, packageLock) {
-  const fix = advisory.fixAvailable;
-  const installedVersion = findInstalledPackageVersion(advisory.packageName, packageLock);
-
-  if (fix && fix !== true && fix.name === advisory.packageName) {
-    const fixVersion = cleanVersion(fix.version);
-    if (isSameMajorVersion(installedVersion, fixVersion)) return fixVersion;
-  }
-
-  const safeRangeVersion = await getLowestSafeSameMajorVersion(advisory.packageName, installedVersion, advisory.range);
-  if (safeRangeVersion) return safeRangeVersion;
-
-  return getLatestSameMajorPackageVersion(advisory.packageName, installedVersion);
-}
-
-function findTopDirectParent(advisory, packageJson, packageLock) {
-  for (const node of advisory.nodes || []) {
-    const topParent = getTopPackageFromNodePath(node);
-    if (topParent && topParent !== advisory.packageName && isDirectDependency(packageJson, topParent)) {
-      return topParent;
-    }
-  }
-
-  const lockParent = findTopDirectParentFromPackageLock(advisory.packageName, packageJson, packageLock);
-  if (lockParent) return lockParent;
-
-  const fix = advisory.fixAvailable;
-  if (fix && fix !== true && isDirectDependency(packageJson, fix.name)) {
-    return fix.name;
-  }
-
-  return null;
-}
-
-function findTopDirectParentFromPackageLock(packageName, packageJson, packageLock) {
-  const packages = packageLock?.packages || {};
-  for (const location of Object.keys(packages)) {
-    if (getLeafPackageFromNodePath(location) !== packageName) continue;
-
-    const topParent = getTopPackageFromNodePath(location);
-    if (topParent && topParent !== packageName && isDirectDependency(packageJson, topParent)) {
-      return topParent;
-    }
-  }
-
-  for (const topParent of getDirectDependencyNames(packageJson)) {
-    if (topParent !== packageName && packageGraphContainsPackage(packageLock, `node_modules/${topParent}`, packageName)) {
-      return topParent;
-    }
-  }
-
-  for (const [topParent, details] of Object.entries(packageLock?.dependencies || {})) {
-    if (topParent !== packageName && isDirectDependency(packageJson, topParent) && dependencyTreeContainsPackage(details, packageName)) {
-      return topParent;
-    }
-  }
-
-  return null;
-}
-
-function packageGraphContainsPackage(packageLock, startLocation, packageName, seen = new Set()) {
-  if (!packageLock?.packages || seen.has(startLocation)) return false;
-  seen.add(startLocation);
-
-  const details = packageLock.packages[startLocation];
-  if (!details?.dependencies) return false;
-
-  for (const dependencyName of Object.keys(details.dependencies)) {
-    if (dependencyName === packageName) return true;
-
-    const dependencyLocation = resolvePackageLockLocation(packageLock, startLocation, dependencyName);
-    if (dependencyLocation && packageGraphContainsPackage(packageLock, dependencyLocation, packageName, seen)) {
-      return true;
-    }
-  }
-
-  return false;
-}
-
-function resolvePackageLockLocation(packageLock, parentLocation, dependencyName) {
-  const nestedLocation = `${parentLocation}/node_modules/${dependencyName}`;
-  if (packageLock.packages?.[nestedLocation]) return nestedLocation;
-
-  const hoistedLocation = `node_modules/${dependencyName}`;
-  if (packageLock.packages?.[hoistedLocation]) return hoistedLocation;
-
-  return null;
-}
-
-function isSameMajorParentBump(plan, packageJson) {
-  return isSameMajorDirectBump(plan.parentName, plan.targetVersion, packageJson);
-}
-
-async function getLatestSameMajorVersion(packageName, packageJson) {
-  const currentRange = getDirectDependencyRange(packageJson, packageName);
-  return getLatestSameMajorPackageVersion(packageName, currentRange);
-}
-
-async function getLatestSameMajorDirectVersion(packageName, packageJson, packageLock) {
-  return getLatestSameMajorPackageVersion(
-    packageName,
-    findDirectOrInstalledVersion(packageName, packageJson, packageLock),
-  );
-}
-
-async function getLowestSafeSameMajorVersion(packageName, currentVersionOrRange, vulnerableRange) {
-  const currentMajor = extractMajor(currentVersionOrRange);
-  if (currentMajor === null || !vulnerableRange) return null;
-
-  const versions = await getPublishedVersions(packageName);
-  const safeVersions = versions
-    .filter((version) => extractMajor(version) === currentMajor)
-    .filter((version) => isVersionGreaterThanRange(version, currentVersionOrRange))
-    .filter((version) => !satisfiesRange(version, vulnerableRange))
-    .sort(compareVersions);
-
-  return safeVersions[0] || null;
-}
-
-async function getLatestSameMajorPackageVersion(packageName, currentVersionOrRange) {
-  const currentMajor = extractMajor(currentVersionOrRange);
-  if (currentMajor === null) return null;
-
-  const versions = await getPublishedVersions(packageName);
-  const latestSameMajor = versions
-    .filter((version) => extractMajor(version) === currentMajor)
-    .sort(compareVersions)
-    .at(-1);
-
-  if (!latestSameMajor) return null;
-  if (!isVersionGreaterThanRange(latestSameMajor, currentVersionOrRange)) return null;
-  return latestSameMajor;
-}
-
-async function getPublishedVersions(packageName) {
-  const result = await run("npm", ["view", packageName, "versions", "--json"], {
-    allowFailure: true,
-    env: { ...process.env, npm_config_audit: "false", npm_config_fund: "false" },
-  });
-  if (result.code !== 0 || !result.stdout.trim()) return [];
-
-  const versions = parseNpmViewVersions(result.stdout);
-  return versions.filter((version) => /^\d+\.\d+\.\d+/.test(version));
-}
-
-function parseNpmViewVersions(stdout) {
-  try {
-    const parsed = JSON.parse(stdout);
-    return Array.isArray(parsed) ? parsed : [parsed].filter(Boolean);
-  } catch {
-    return stdout.split(/\s+/).map((item) => item.trim()).filter(Boolean);
-  }
-}
-
-function isVersionGreaterThanRange(version, range) {
-  const current = cleanVersion(range);
-  if (!current) return true;
-  return compareVersions(current, version) < 0;
-}
-
-function satisfiesRange(version, range) {
-  const alternatives = String(range || "")
-    .split("||")
-    .map((part) => part.trim())
-    .filter(Boolean);
-
-  if (alternatives.length === 0) return false;
-  return alternatives.some((alternative) => satisfiesComparatorSet(version, alternative));
-}
-
-function satisfiesComparatorSet(version, rangePart) {
-  const comparators = normalizeComparatorSet(rangePart);
-  if (comparators.length === 0) return false;
-
-  return comparators.every((comparator) => satisfiesComparator(version, comparator));
-}
-
-function normalizeComparatorSet(rangePart) {
-  const trimmed = String(rangePart || "").trim();
-  const hyphen = trimmed.match(/^(\d+(?:\.\d+){0,2})\s+-\s+(\d+(?:\.\d+){0,2})$/);
-  if (hyphen) {
-    return [`>=${normalizeVersion(hyphen[1])}`, `<=${normalizeVersion(hyphen[2])}`];
-  }
-
-  return trimmed
-    .split(/\s+/)
-    .map((item) => item.trim())
-    .filter(Boolean)
-    .flatMap((item) => expandComparator(item));
-}
-
-function expandComparator(comparator) {
-  const match = comparator.match(/^(<=|>=|<|>|=|~|\^)?\s*(\d+(?:\.\d+){0,2})$/);
-  if (!match) return [];
-
-  const operator = match[1] || "=";
-  const version = normalizeVersion(match[2]);
-
-  if (operator === "^") {
-    const major = extractMajor(version);
-    if (major === null) return [];
-    return [`>=${version}`, `<${major + 1}.0.0`];
-  }
-
-  if (operator === "~") {
-    const [major, minor] = version.split(".").map((part) => Number.parseInt(part, 10) || 0);
-    return [`>=${version}`, `<${major}.${minor + 1}.0`];
-  }
-
-  return [`${operator}${version}`];
-}
-
-function satisfiesComparator(version, comparator) {
-  const match = comparator.match(/^(<=|>=|<|>|=)(\d+\.\d+\.\d+)$/);
-  if (!match) return false;
-
-  const [, operator, target] = match;
-  const comparison = compareVersions(version, target);
-
-  if (operator === "<") return comparison < 0;
-  if (operator === "<=") return comparison <= 0;
-  if (operator === ">") return comparison > 0;
-  if (operator === ">=") return comparison >= 0;
-  return comparison === 0;
-}
-
-function normalizeVersion(version) {
-  const parts = String(version || "")
-    .split(".")
-    .map((part) => Number.parseInt(part, 10) || 0);
-
-  while (parts.length < 3) parts.push(0);
-  return parts.slice(0, 3).join(".");
-}
-
-function compareVersions(left, right) {
-  const leftParts = String(left).split(".").map((part) => Number.parseInt(part, 10) || 0);
-  const rightParts = String(right).split(".").map((part) => Number.parseInt(part, 10) || 0);
-  for (let index = 0; index < Math.max(leftParts.length, rightParts.length); index += 1) {
-    const difference = (leftParts[index] || 0) - (rightParts[index] || 0);
-    if (difference !== 0) return difference;
-  }
-  return 0;
-}
-
-function isSameMajorDirectBump(packageName, targetVersion, packageJson) {
-  const currentRange = getDirectDependencyRange(packageJson, packageName);
-  const currentMajor = extractMajor(currentRange);
-  const targetMajor = extractMajor(targetVersion);
-
-  if (currentMajor === null || targetMajor === null) return true;
-  return currentMajor === targetMajor;
-}
-
-function isSameMajorVersion(currentVersion, targetVersion) {
-  const currentMajor = extractMajor(currentVersion);
-  const targetMajor = extractMajor(targetVersion);
-
-  if (currentMajor === null || targetMajor === null) return true;
-  return currentMajor === targetMajor;
-}
-
-function findInstalledPackageVersion(packageName, packageLock) {
-  const packages = packageLock?.packages || {};
-  for (const [location, details] of Object.entries(packages)) {
-    if (getLeafPackageFromNodePath(location) === packageName && details?.version) {
-      return details.version;
-    }
-  }
-
-  return findInstalledPackageVersionInDependencyTree(packageName, packageLock?.dependencies || {});
-}
-
-function findInstalledPackageVersionInDependencyTree(packageName, dependencies) {
-  for (const [dependencyName, details] of Object.entries(dependencies || {})) {
-    if (dependencyName === packageName && details?.version) {
-      return details.version;
-    }
-
-    const nestedVersion = findInstalledPackageVersionInDependencyTree(packageName, details?.dependencies || {});
-    if (nestedVersion) return nestedVersion;
-  }
-
-  return null;
-}
-
-function dependencyTreeContainsPackage(details, packageName) {
-  if (!details) return false;
-  if (details.dependencies?.[packageName]) return true;
-
-  return Object.values(details.dependencies || {}).some((nestedDetails) => (
-    dependencyTreeContainsPackage(nestedDetails, packageName)
-  ));
-}
-
-function getDirectDependencyRange(packageJson, packageName) {
-  return packageJson.dependencies?.[packageName]
-    || packageJson.devDependencies?.[packageName]
-    || packageJson.optionalDependencies?.[packageName]
-    || null;
-}
-
-function findDirectOrInstalledVersion(packageName, packageJson, packageLock) {
-  return getDirectDependencyRange(packageJson, packageName)
-    || findInstalledPackageVersion(packageName, packageLock);
-}
-
-function getDirectDependencyNames(packageJson) {
-  return [
-    ...Object.keys(packageJson.dependencies || {}),
-    ...Object.keys(packageJson.devDependencies || {}),
-    ...Object.keys(packageJson.optionalDependencies || {}),
-  ];
-}
-
-function extractMajor(versionOrRange) {
-  const match = String(versionOrRange || "").match(/\d+/);
-  return match ? Number.parseInt(match[0], 10) : null;
-}
-
-function getTopPackageFromNodePath(nodePath) {
-  const packages = getPackageNamesFromNodePath(nodePath);
-  return packages[0] || null;
-}
-
-function getLeafPackageFromNodePath(nodePath) {
-  const packages = getPackageNamesFromNodePath(nodePath);
-  return packages[packages.length - 1] || null;
-}
-
-function getPackageNamesFromNodePath(nodePath) {
-  const parts = String(nodePath || "").split("/node_modules/");
-  const first = parts[0].startsWith("node_modules/") ? parts[0].slice("node_modules/".length) : parts[0];
-  const candidates = [first, ...parts.slice(1)].filter(Boolean);
-  return candidates.map((candidate) => {
-    const segments = candidate.split("/").filter(Boolean);
-    if (segments[0]?.startsWith("@") && segments[1]) return `${segments[0]}/${segments[1]}`;
-    return segments[0] || null;
-  }).filter(Boolean);
-}
-
-async function buildPullRequestContent({ advisory, plan, checks, diffSummary }) {
-  const risk = classifyRisk(advisory, plan);
-  const validation = checks.map((check) => `- ${check.ok ? "Passed" : "Failed"}: \`${check.command}\``).join("\n");
-
-  const bodySections = [
-    "## Vulnerability",
-    "",
-    `- Package: \`${advisory.packageName}\``,
-    `- Advisory: ${advisory.url ? `[${advisory.advisoryId}](${advisory.url})` : advisory.advisoryId}`,
-    `- Severity: ${advisory.severity}`,
-    `- Direct dependency: ${advisory.isDirect ? "yes" : "no"}`,
-    `- Affected range: \`${advisory.range || "unknown"}\``,
-    "",
-    "## Remediation",
-    "",
-    `- Strategy: ${plan.type}`,
-    `- Change: ${plan.explanation}`,
-    "",
-    "## Validation",
-    "",
-    validation || "- npm audit check passed for this advisory",
-    "",
-    "## Risk",
-    "",
-    `Risk: **${risk.level}**`,
-    "",
-    risk.reasons.map((reason) => `- ${reason}`).join("\n"),
-  ];
-
-  if (plan.type === "direct-upgrade") {
-    return {
-      title: `fix(deps): bump ${advisory.packageName} to ${plan.targetVersion}`,
-      body: [
-        ...bodySections,
-        "",
-        "## Template",
-        "",
-        "Direct package bump.",
-        "",
-        "- Updated direct dependency `" + advisory.packageName + "` to `" + plan.targetVersion + "`.",
-        "",
-        "## Diff Summary",
-        "",
-        "```text",
-        diffSummary.trim() || "package.json / package-lock.json updated",
-        "```",
-      ].join("\n"),
-    };
-  }
-
-  if (plan.type === "parent-upgrade") {
-    return {
-      title: `fix(deps): update ${plan.parentName} to remediate ${advisory.packageName}`,
-      body: [
-        ...bodySections,
-        "",
-        "## Template",
-        "",
-        "Nested/transitive package case.",
-        "",
-        "- Updated top-level parent dependency `" + plan.parentName + "` to `" + plan.targetVersion + "`.",
-        "- This remediates the transitive vulnerability in `" + advisory.packageName + "`.",
-        "",
-        "## Diff Summary",
-        "",
-        "```text",
-        diffSummary.trim() || "package.json / package-lock.json updated",
-        "```",
-      ].join("\n"),
-    };
-  }
-
-  if (plan.type === "override") {
-    return {
-      title: `fix(deps): add override for ${advisory.packageName} ${plan.targetVersion}`,
-      body: [
-        ...bodySections,
-        "",
-        "## Template",
-        "",
-        "Override case.",
-        "",
-        "- Added an npm override for `" + advisory.packageName + "` at `" + plan.targetVersion + "`.",
-        "",
-        "## Diff Summary",
-        "",
-        "```text",
-        diffSummary.trim() || "package.json / package-lock.json updated",
-        "```",
-      ].join("\n"),
-    };
-  }
-
-  return {
-    title: `vulPilot: remediate ${advisory.advisoryId} in ${advisory.packageName}`,
-    body: [
-      ...bodySections,
-      "",
-      "## Diff Summary",
-      "",
-      "```text",
-      diffSummary.trim() || "package.json / package-lock.json updated",
-      "```",
-    ].join("\n"),
-  };
-}
-
-function classifyRisk(advisory, plan) {
-  const reasons = [];
-  let score = 0;
-
-  if (plan.isSemVerMajor) {
-    score += 2;
-    reasons.push("The remediation requires a semver-major dependency change.");
-  }
-  if (!advisory.isDirect) {
-    score += 1;
-    reasons.push("The affected package is transitive, so behavior depends on the parent dependency tree.");
-  }
-  if (plan.type === "override") {
-    score += 1;
-    reasons.push("The remediation uses npm overrides, which should be reviewed against parent package compatibility.");
-  }
-  if (["critical", "high"].includes(advisory.severity)) {
-    reasons.push(`The advisory severity is ${advisory.severity}.`);
-  }
-  if (reasons.length === 0) {
-    reasons.push("Patch is limited to package metadata and lockfile changes, with validation checks passing.");
-  }
-
-  return {
-    level: score >= 3 ? "High" : score >= 1 ? "Medium" : "Low",
-    reasons,
-  };
-}
-
-async function runProjectChecks() {
-  const packageJson = await readPackageJson();
-  const checks = [];
-  const scripts = packageJson.scripts || {};
-
-  const commands = [
-    scripts.lint ? ["lint", "npm", ["run", "lint"]] : null,
-    scripts.test ? ["test", "npm", ["test"]] : null,
-    scripts.build ? ["build", "npm", ["run", "build"]] : null,
-  ].filter(Boolean);
-
-  for (const [name, command, args] of commands) {
-    const rendered = `${command} ${args.join(" ")}`;
-    try {
-      await run(command, args, { allowFailure: false });
-      checks.push({ name, command: rendered, ok: true });
-    } catch (error) {
-      checks.push({ name, command: rendered, ok: false, output: error.message });
-    }
-  }
-
-  return checks;
-}
-
-function getOwnerAndRepo(repository) {
-  const { pathname } = new URL(repository);
-  const [owner, repo] = pathname.replace(/^\/|\/$/g, "").split("/");
-
-  return {
-    owner,
-    repo: repo?.replace(/\.git$/, ""),
-  };
-}
-
-
-async function openOrUpdatePullRequest(result) {
-  const { owner, repo } = getOwnerAndRepo(repository);
-  const headers = githubHeaders();
-  const head = `${owner}:${result.branch}`;
-  const existingResponse = await fetch(
-    `https://api.github.com/repos/${owner}/${repo}/pulls?state=open&head=${encodeURIComponent(head)}&base=${encodeURIComponent(baseBranch)}`,
-    { headers },
-  );
-  /* if (!existingResponse.ok) {
-    throw new Error(`Failed to look up existing PRs: ${existingResponse.status} ${await existingResponse.text()}`);
-  } */
-  const existing = await existingResponse.json();
-
-  if (existing.length > 0) {
-    const pr = existing[0];
-    const updateResponse = await fetch(`https://api.github.com/repos/${owner}/${repo}/pulls/${pr.number}`, {
-      method: "PATCH",
-      headers,
-      body: JSON.stringify({ title: result.title, body: result.body }),
-    });
-    if (!updateResponse.ok) {
-      throw new Error(`Failed to update PR #${pr.number}: ${updateResponse.status} ${await updateResponse.text()}`);
-    }
-    console.log(`Updated PR #${pr.number}: ${result.title}`);
-    return;
-  }
-  console.log(`PR url : https://api.github.com/repos/${owner}/${repo}/pulls`);
-  const createResponse = await fetch(`https://api.github.com/repos/${owner}/${repo}/pulls`, {
-    method: "POST",
-    headers,
-    body: JSON.stringify({
-      title: result.title,
-      body: result.body,
-      head: result.branch,
-      base: baseBranch,
-      maintainer_can_modify: true,
-    }),
-  });
-  console.log(`Creating PR for branch`, createResponse);
-  if (!createResponse.ok) {
-    throw new Error(`Failed to create PR: ${createResponse.status} ${await createResponse.text()}`);
-  }
-  const pr = await createResponse.json();
-  console.log(`Created PR #${pr.number}: ${result.title}`);
-}
-
-function githubHeaders() {
-  return {
-    Accept: "application/vnd.github+json",
-    Authorization: `Bearer ${githubToken}`,
-    "Content-Type": "application/json",
-    "X-GitHub-Api-Version": "2022-11-28",
-  };
-}
-
-/* async function pushBranch(branch) {
-  await git(["push", "--force-with-lease", "origin", `${branch}:${branch}`]);
-} */
-
-async function pushBranch(branch) {
-  const remoteSha = await getRemoteBranchSha(branch);
-  if (remoteSha) {
-    await git([
-      "push",
-      `--force-with-lease=refs/heads/${branch}:${remoteSha}`,
-      "origin",
-      `${branch}:refs/heads/${branch}`,
-    ]);
+  const openPulls = await api(token, `/repos/${repository}/pulls?state=open&head=${encodeURIComponent(`${owner}:${branch}`)}`);
+  if (openPulls.length) {
+    console.log(`An open remediation PR already exists: ${openPulls[0].html_url}`);
     return;
   }
 
-  await git(["push", "origin", `${branch}:refs/heads/${branch}`]);
-}
+  run('git', ['checkout', '-B', branch]);
+  run('git', ['config', 'user.name', 'github-actions[bot]']);
+  run('git', ['config', 'user.email', '41898282+github-actions[bot]@users.noreply.github.com']);
+  run('git', ['add', '--', 'package.json', 'package-lock.json']);
+  run('git', ['commit', '-m', prTitle(change, advisory)]);
+  run('git', ['push', '--force-with-lease', 'origin', branch]);
 
-async function getRemoteBranchSha(branch) {
-  const result = await run("git", ["ls-remote", "--heads", "origin", branch], { allowFailure: false });
-  const line = result.stdout.trim().split("\n").find(Boolean);
-  if (!line) return null;
-  return line.split(/\s+/)[0] || null;
-}
-
-async function checkoutBase() {
-  await git(["fetch", "origin", baseBranch]);
-  await git(["checkout", "-B", baseBranch, `origin/${baseBranch}`]);
-  await git(["reset", "--hard", `origin/${baseBranch}`]);
-}
-
-async function checkoutBranch(branch) {
-  await git(["checkout", "-B", branch]);
-}
-
-async function configureGit() {
-  await git(["config", "user.name", "github-actions[bot]"]);
-  await git(["config", "user.email", "41898282+github-actions[bot]@users.noreply.github.com"]);
-}
-
-async function npmAudit() {
-  const result = await run("npm", ["audit", "--json"], { allowFailure: true });
-  if (!result.stdout.trim()) return {};
-  try {
-    return JSON.parse(result.stdout);
-  } catch (error) {
-    throw new Error(`Failed to parse npm audit JSON: ${error.message}`);
-  }
-}
-
-function extractAdvisories(audit, packageJson) {
-  const vulnerabilities = audit.vulnerabilities || {};
-  const advisories = [];
-
-  for (const [packageName, vulnerability] of Object.entries(vulnerabilities)) {
-    const viaObjects = Array.isArray(vulnerability.via)
-      ? vulnerability.via.filter((item) => item && typeof item === "object")
-      : [];
-
-    if (viaObjects.length === 0) {
-      advisories.push(makeAdvisory({ packageName, vulnerability, via: null, packageJson }));
-      continue;
-    }
-
-    for (const via of viaObjects) {
-      advisories.push(makeAdvisory({ packageName, vulnerability, via, packageJson }));
-    }
-  }
-
-  const unique = new Map();
-  for (const advisory of advisories) {
-    if (!unique.has(advisory.key)) unique.set(advisory.key, advisory);
-  }
-  return [...unique.values()];
-}
-
-function makeAdvisory({ packageName, vulnerability, via, packageJson }) {
-  const advisoryId = via?.url?.match(/GHSA-[a-z0-9-]+/i)?.[0]
-    || via?.cves?.[0]
-    || via?.source?.toString()
-    || `${packageName}-${vulnerability.range || "unknown"}`;
-
-  return {
-    key: `${packageName}:${advisoryId}`,
-    packageName,
-    advisoryId,
-    title: via?.title || vulnerability.title || `${packageName} vulnerability`,
-    severity: normalizeSeverity(via?.severity || vulnerability.severity || "low"),
-    url: via?.url || null,
-    cves: via?.cves || [],
-    cvss: via?.cvss || null,
-    range: via?.range || vulnerability.range || null,
-    nodes: vulnerability.nodes || [],
-    effects: vulnerability.effects || [],
-    isDirect: Boolean(vulnerability.isDirect) || isDirectDependency(packageJson, packageName),
-    fixAvailable: vulnerability.fixAvailable,
-  };
-}
-
-function advisoryStillPresent(audit, original) {
-  return extractAdvisories(audit, { dependencies: {}, devDependencies: {}, optionalDependencies: {} })
-    .some((item) => item.packageName === original.packageName && item.advisoryId === original.advisoryId);
-}
-
-function compareAdvisories(left, right) {
-  const severity = severityRank.get(right.severity) - severityRank.get(left.severity);
-  if (severity !== 0) return severity;
-  if (left.isDirect !== right.isDirect) return left.isDirect ? -1 : 1;
-  return left.packageName.localeCompare(right.packageName);
-}
-
-function isDirectDependency(packageJson, packageName) {
-  return Boolean(
-    packageJson.dependencies?.[packageName]
-      || packageJson.devDependencies?.[packageName]
-      || packageJson.optionalDependencies?.[packageName],
-  );
-}
-
-async function readPackageJson() {
-  return JSON.parse(await readFile(packageJsonPath, "utf8"));
-}
-
-async function readPackageLock() {
-  return JSON.parse(await readFile(packageLockPath, "utf8"));
-}
-
-async function writePackageJson(packageJson) {
-  await writeFile(packageJsonPath, `${JSON.stringify(packageJson, null, 2)}\n`);
-}
-
-async function git(args) {
-  const result = await run("git", args, { allowFailure: false });
-  return result.stdout;
-}
-
-async function run(command, args, options = {}) {
-  const { allowFailure = false, env = process.env } = options;
-  return new Promise((resolve, reject) => {
-    const child = spawn(command, args, {
-      cwd: root,
-      env,
-      stdio: ["ignore", "pipe", "pipe"],
-    });
-
-    let stdout = "";
-    let stderr = "";
-    child.stdout.on("data", (chunk) => {
-      stdout += chunk.toString();
-      process.stdout.write(chunk);
-    });
-    child.stderr.on("data", (chunk) => {
-      stderr += chunk.toString();
-      process.stderr.write(chunk);
-    });
-    child.on("error", reject);
-    child.on("close", (code) => {
-      if (code === 0 || allowFailure) {
-        resolve({ code, stdout, stderr });
-      } else {
-        reject(new Error(`${command} ${args.join(" ")} failed with exit code ${code}\n${stderr || stdout}`));
-      }
-    });
+  const pull = await api(token, `/repos/${repository}/pulls`, {
+    method: 'POST',
+    body: { title: prTitle(change, advisory), head: branch, base, body: prBody(change, advisory) },
   });
+  console.log(`Created PR: ${pull.html_url}`);
 }
 
-function cleanVersion(version) {
-  if (!version || typeof version !== "string") return null;
-  return version.replace(/^[^\d]*/, "");
-}
-
-function normalizeSeverity(severity) {
-  const normalized = String(severity || "low").toLowerCase();
-  return severityRank.has(normalized) ? normalized : "low";
-}
-
-function parseBoolean(value, defaultValue) {
-  if (value === undefined || value === null || value === "") return defaultValue;
-  return ["1", "true", "yes", "on"].includes(String(value).toLowerCase());
-}
-
-function parsePositiveInt(value, defaultValue) {
-  const parsed = Number.parseInt(value || String(defaultValue), 10);
-  return Number.isFinite(parsed) && parsed > 0 ? parsed : defaultValue;
-}
-
-function slugify(value) {
-  return String(value)
-    .toLowerCase()
-    .replace(/[^a-z0-9._-]+/g, "-")
-    .replace(/^-+|-+$/g, "")
-    .slice(0, 80);
-}
+main().catch((error) => {
+  console.error(`Remediation failed: ${error.message}`);
+  process.exitCode = 1;
+});
