@@ -6,7 +6,7 @@ on:
       max_prs:
         description: Maximum remediation PRs to create (blank uses VULNERABILITY_MAX_PRS or 3)
         required: false
-        default: ""
+        default: "3"
   schedule:
     # Every weekday at 06:15 UTC. Adjust to your vulnerability-response SLA.
     - cron: '15 6 * * 1-5'
