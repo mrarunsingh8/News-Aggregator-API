@@ -10,21 +10,40 @@
  * `GITHUB_REPOSITORY` is used when available; otherwise the script derives
  * owner/repository from the origin remote.
  *
+ * Remediation strategy, in order of preference:
+ *   1. direct           - the vulnerable package is a direct dependency; bump it.
+ *   2. transitive-bump   - a direct parent (or the package npm audit names as
+ *                          the fix target) can be bumped to a version that no
+ *                          longer resolves the vulnerable range.
+ *   3. override          - no parent upgrade exists yet. Falls back to an
+ *                          npm `overrides` entry pinned to the minimum patched
+ *                          version of the vulnerable package, scoped to the
+ *                          offending parent when one is known. Disabled by
+ *                          setting REMEDIATION_ALLOW_OVERRIDE=false.
+ *
  * Optional environment:
- *   VULNERABILITY_PACKAGE    limits a run to one package; otherwise the script
- *                            selects one safe candidate from npm audit itself
- *   REMEDIATION_BASE         PR base branch (default: GITHUB_REF_NAME, then main)
- *   REMEDIATION_DRY_RUN      "true" skips branch/PR creation
- *   MAX_PRS                  maximum remediation PRs to create (default: 3)
- *   REMEDIATION_VALIDATION   newline-separated commands, e.g. "npm test\nnpm run lint"
- *   REMEDIATION_PLAN         optional explicit parent-bump plan, for example:
- *                            {"package":"qs","strategy":"transitive-bump","parent":{"name":"body-parser","version":"1.20.3"}}
+ *   VULNERABILITY_PACKAGE     limits a run to one package; otherwise the script
+ *                             selects candidates from npm audit itself
+ *   REMEDIATION_BASE          PR base branch (default: GITHUB_REF_NAME, then main)
+ *   REMEDIATION_DRY_RUN       "true" skips branch/PR creation
+ *   MAX_PRS                   maximum remediation PRs to create (default: 3)
+ *   REMEDIATION_VALIDATION    newline-separated commands, e.g. "npm test\nnpm run lint"
+ *                             required whenever a change needs compatibility
+ *                             verification (major bumps and all overrides)
+ *   REMEDIATION_ALLOW_OVERRIDE  "false" disables the override strategy entirely,
+ *                                so nested vulnerabilities with no safe parent
+ *                                upgrade are skipped instead of overridden
+ *                                (default: true)
+ *   REMEDIATION_PLAN          optional explicit plan, for example:
+ *                             {"package":"qs","strategy":"transitive-bump","parent":{"name":"body-parser","version":"1.20.3"}}
+ *                             or:
+ *                             {"package":"qs","strategy":"override","fixedVersion":"6.11.2","parent":"body-parser"}
  *
  * The script intentionally does not call `npm audit fix` or use `--force`:
  * either can modify unrelated packages, violating the one-vulnerability-per-PR
  * contract. When audit does not name a fixed direct version, it queries npm's
  * registry and uses semver to find the smallest safe version in the current
- * major line.
+ * major line (or, for overrides, the smallest safe version overall).
  */
 
 'use strict';
@@ -35,6 +54,7 @@ const { spawnSync } = require('node:child_process');
 const API_VERSION = '2022-11-28';
 const BRANCH_ROOT = 'security-remediation';
 const dryRun = process.env.REMEDIATION_DRY_RUN === 'true' || process.env.DRY_RUN === 'true';
+const overridesAllowed = process.env.REMEDIATION_ALLOW_OVERRIDE !== 'false';
 let cachedSemver;
 
 function repositoryFromOrigin() {
@@ -164,18 +184,15 @@ function lockedVersion(packageName) {
   return nested?.[1]?.version || null;
 }
 
-function fixedVersionFromRegistry(packageName, declaredRange, vulnerability, { allowMajor = false } = {}) {
-  const semver = semverLibrary();
-  const current = lockedVersion(packageName) || semver.minVersion(declaredRange)?.version;
-  if (!current || !semver.valid(current)) return null;
-  const currentMajor = semver.major(current);
-  const currentMinor = semver.minor(current);
+function vulnerableRanges(vulnerability) {
   const ranges = (vulnerability.via || [])
     .filter((item) => typeof item === 'object' && item.range)
     .map((item) => item.range);
   if (!ranges.length && vulnerability.range) ranges.push(vulnerability.range);
-  if (!ranges.length) return null;
+  return ranges;
+}
 
+function registryVersions(packageName) {
   const output = run('npm', ['view', packageName, 'versions', '--json'], { capture: true });
   let versions;
   try {
@@ -183,12 +200,44 @@ function fixedVersionFromRegistry(packageName, declaredRange, vulnerability, { a
   } catch {
     throw new Error(`npm registry returned invalid version data for ${packageName}.`);
   }
-  const candidates = (Array.isArray(versions) ? versions : [versions])
+  return Array.isArray(versions) ? versions : [versions];
+}
+
+function fixedVersionFromRegistry(packageName, declaredRange, vulnerability, { allowMajor = false } = {}) {
+  const semver = semverLibrary();
+  const current = lockedVersion(packageName) || semver.minVersion(declaredRange)?.version;
+  if (!current || !semver.valid(current)) return null;
+  const currentMajor = semver.major(current);
+  const currentMinor = semver.minor(current);
+  const ranges = vulnerableRanges(vulnerability);
+  if (!ranges.length) return null;
+
+  const candidates = registryVersions(packageName)
     .filter((version) => semver.valid(version) && !semver.prerelease(version))
     .filter((version) => allowMajor || semver.major(version) === currentMajor)
     // In 0.x, a minor bump can be breaking, so preserve the current minor too.
     .filter((version) => allowMajor || currentMajor !== 0 || semver.minor(version) === currentMinor)
     .filter((version) => semver.gte(version, current))
+    .filter((version) => ranges.every((range) => !semver.satisfies(version, range)))
+    .sort(semver.compare);
+  return candidates[0] || null;
+}
+
+// Case 3: the minimum patched version across ALL major lines, not just the
+// currently installed major. An override pins the resolved version directly,
+// so (unlike a direct or transitive bump) there is no reason to prefer
+// staying within the current major - the smallest version that clears every
+// vulnerable range is the least invasive fix. Callers still gate this behind
+// a mandatory validation run because overrides can change any transitive
+// consumer's resolved version, not just the vulnerable path.
+function minimumPatchedVersion(packageName, vulnerability) {
+  const semver = semverLibrary();
+  const ranges = vulnerableRanges(vulnerability);
+  if (!ranges.length) return null;
+  const current = lockedVersion(packageName);
+  const candidates = registryVersions(packageName)
+    .filter((version) => semver.valid(version) && !semver.prerelease(version))
+    .filter((version) => !current || semver.valid(current) === false || semver.gte(version, current))
     .filter((version) => ranges.every((range) => !semver.satisfies(version, range)))
     .sort(semver.compare);
   return candidates[0] || null;
@@ -205,9 +254,7 @@ function latestParentUpgrade(packageName, declaredRange) {
   const semver = semverLibrary();
   const current = lockedVersion(packageName) || semver.minVersion(declaredRange)?.version;
   if (!current || !semver.valid(current)) return null;
-  const output = run('npm', ['view', packageName, 'versions', '--json'], { capture: true });
-  const versions = JSON.parse(output);
-  return (Array.isArray(versions) ? versions : [versions])
+  return registryVersions(packageName)
     .filter((version) => semver.valid(version) && !semver.prerelease(version) && semver.gt(version, current))
     .sort(semver.rcompare)[0] || null;
 }
@@ -233,20 +280,32 @@ function packageNamesInLockPath(packagePath) {
   return names;
 }
 
+// Every direct-dependency ancestor path that leads to the vulnerable package
+// in the installed tree. Used both to pick the top parent for a
+// transitive-bump and to scope an override to only the parents that actually
+// introduce the vulnerable version (Case 2's "identify every dependency
+// path" and "if multiple parents introduce the same vulnerable dependency,
+// analyze every path independently").
+function ancestorPaths(packageName) {
+  const lockfile = readJson('package-lock.json');
+  const directNames = directDependencyNames(readJson('package.json'));
+  const paths = [];
+  for (const path of Object.keys(lockfile.packages || {})) {
+    const names = packageNamesInLockPath(path);
+    if (names.at(-1) !== packageName) continue;
+    const ancestors = names.slice(0, -1);
+    const parent = ancestors.find((name) => directNames.has(name));
+    paths.push({ ancestors, parent: parent || null });
+  }
+  return paths;
+}
+
 function topParent(manifest, packageName, vulnerability) {
   const directNames = directDependencyNames(manifest);
   const auditCandidates = [availableFix(vulnerability)?.name, ...(vulnerability.effects || [])];
   const fromAudit = auditCandidates.find((name) => name !== packageName && directNames.has(name));
   if (fromAudit) return fromAudit;
-
-  const lockfile = readJson('package-lock.json');
-  for (const path of Object.keys(lockfile.packages || {})) {
-    const names = packageNamesInLockPath(path);
-    if (names.at(-1) !== packageName) continue;
-    const parent = names.slice(0, -1).find((name) => directNames.has(name));
-    if (parent) return parent;
-  }
-  return null;
+  return ancestorPaths(packageName).find((path) => path.parent)?.parent || null;
 }
 
 function isMajorUpgrade(packageName, oldRange, newVersion) {
@@ -264,6 +323,14 @@ function quote(value) {
   return String(value).replace(/`/g, '\\`');
 }
 
+// Scopes the override to a single parent when one is known
+// (`overrides: { parent: { pkg: version } }`) instead of a blanket
+// `overrides: { pkg: version }`. A scoped override only affects the
+// offending dependency path, so other parts of the tree that depend on the
+// same package through a different, unaffected parent keep resolving
+// normally. Falls back to a blanket override only when no parent is known
+// (the vulnerable package is a root-level transitive dependency with no
+// direct-dependency ancestor in the lockfile).
 function setOverride(manifest, vulnerablePackage, fixedVersion, parent) {
   manifest.overrides ||= {};
   if (!parent) {
@@ -276,6 +343,37 @@ function setOverride(manifest, vulnerablePackage, fixedVersion, parent) {
   manifest.overrides[parent] = { ...(manifest.overrides[parent] || {}), [vulnerablePackage]: fixedVersion };
 }
 
+// Case 3 fallback: no direct fix and no parent upgrade exists yet. Pin the
+// vulnerable package to its minimum patched version via npm `overrides`,
+// scoped to the offending parent when the dependency graph names one.
+// requiresCompatibility is always true here (not just on major bumps) since
+// an override changes how npm's resolver satisfies every requester of the
+// package, not only the flagged one - validate() below refuses to apply it
+// without an explicit REMEDIATION_VALIDATION command.
+function overrideChange(manifest, packageName, vulnerability, plan) {
+  if (!overridesAllowed) {
+    throw new Error('override strategy is disabled (REMEDIATION_ALLOW_OVERRIDE=false).');
+  }
+  const parent = plan?.parent
+    ? (typeof plan.parent === 'string' ? plan.parent : plan.parent.name)
+    : ancestorPaths(packageName).find((path) => path.parent)?.parent || null;
+  const fixedVersion = plan?.fixedVersion || minimumPatchedVersion(packageName, vulnerability);
+  if (!fixedVersion) {
+    throw new Error(`No patched version of ${packageName} exists on the registry to override to.`);
+  }
+  const oldRange = lockedVersion(packageName) || 'unresolved';
+  return {
+    type: 'override',
+    vulnerablePackage: packageName,
+    changedPackage: packageName,
+    parent,
+    oldRange,
+    newVersion: fixedVersion,
+    requiresCompatibility: true,
+    apply() { setOverride(manifest, packageName, fixedVersion, parent); },
+  };
+}
+
 function selectChange(manifest, packageName, vulnerability, plan) {
   const directSection = dependencySection(manifest, packageName);
   const auditFixedVersion = fixedVersionFromAudit(vulnerability, packageName);
@@ -284,6 +382,10 @@ function selectChange(manifest, packageName, vulnerability, plan) {
   const parentSection = parentName && dependencySection(manifest, parentName);
   const fixedVersion = plan?.fixedVersion || auditFixedVersion
     || fixedVersionFromRegistry(packageName, directSection ? manifest[directSection][packageName] : '*', vulnerability, { allowMajor: true });
+
+  if (plan?.strategy === 'override') {
+    return overrideChange(manifest, packageName, vulnerability, plan);
+  }
 
   // For a nested finding, npm audit's parent fix is the least-invasive repair.
   if (!plan && fix?.name && fix.name !== packageName && fix.version) {
@@ -333,10 +435,17 @@ function selectChange(manifest, packageName, vulnerability, plan) {
     };
   }
 
-  if (plan?.strategy && plan.strategy !== 'transitive-bump') {
+  if (plan?.strategy && plan.strategy !== 'override' && plan.strategy !== 'transitive-bump') {
     throw new Error(`Unsupported remediation strategy: ${plan.strategy}`);
   }
-  throw new Error(`No safe direct or parent upgrade was found for nested ${packageName}; override remediation is disabled by policy.`);
+
+  // No direct fix and no parent upgrade exists yet (Case 3 precondition).
+  // Fall back to a scoped override unless the operator explicitly disabled it.
+  try {
+    return overrideChange(manifest, packageName, vulnerability, plan);
+  } catch (overrideError) {
+    throw new Error(`No safe direct or parent upgrade was found for nested ${packageName}, and override remediation was unavailable: ${overrideError.message}`);
+  }
 }
 
 function severityRank(severity) {
@@ -397,8 +506,37 @@ function branchName(change, advisory) {
 
 function prTitle(change, advisory) {
   if (change.type === 'direct') return `security(direct): remediate ${advisory.id} in ${change.changedPackage}`;
-  if (change.type === 'transitive-bump') return `security(transitive): remediate ${advisory.id} via ${change.changedPackage}`;
+  if (change.type === 'override') return `security(override): pin ${change.changedPackage} for ${advisory.id}`;
   return `security(transitive): remediate ${advisory.id} via ${change.changedPackage}`;
+}
+
+function strategyExplanation(change) {
+  if (change.type === 'direct') {
+    return `\`${quote(change.vulnerablePackage)}\` is a direct dependency, so it was bumped in place.`;
+  }
+  if (change.type === 'transitive-bump') {
+    return `\`${quote(change.vulnerablePackage)}\` is a transitive dependency introduced by \`${quote(change.changedPackage)}\`. A newer release of \`${quote(change.changedPackage)}\` already resolves to a patched \`${quote(change.vulnerablePackage)}\`, so the parent was bumped instead of overriding the nested package directly.`;
+  }
+  return `\`${quote(change.vulnerablePackage)}\` is a transitive dependency${change.parent ? ` introduced by \`${quote(change.parent)}\`` : ''}. No released version of ${change.parent ? `\`${quote(change.parent)}\`` : 'any known parent'} yet depends on a patched \`${quote(change.vulnerablePackage)}\`, so a direct or parent-bump remediation is not currently available.`;
+}
+
+function overrideSection(change) {
+  if (change.type !== 'override') return '';
+  const scope = change.parent
+    ? `scoped to \`${quote(change.parent)}\` (\`overrides: { "${quote(change.parent)}": { "${quote(change.vulnerablePackage)}": "${quote(change.newVersion)}" } }\`), so only that dependency path is affected`
+    : 'applied package-wide (no direct-dependency parent was found in the lockfile for this package), so it affects every path that resolves this package';
+  return `
+## Why an override was used
+- No parent package currently depends on a patched \`${quote(change.vulnerablePackage)}\`; a direct or parent-bump remediation was not available.
+- Target override version: \`${quote(change.newVersion)}\` (minimum published version outside every vulnerable range reported by npm audit).
+- Scope: the override is ${scope}.
+- Compatibility: overrides bypass the dependent's own declared version range for this package, so the change is validated against \`REMEDIATION_VALIDATION\` before this PR is opened, not just \`npm audit\`.
+
+## Rollback
+1. Revert this PR (or run \`git revert\` on its merge commit).
+2. Alternatively, manually remove the \`${quote(change.vulnerablePackage)}\`${change.parent ? ` entry under \`overrides.${quote(change.parent)}\`` : ' entry under \`overrides\`'} in \`package.json\`, then run \`npm install\` to regenerate \`package-lock.json\`.
+3. Re-run \`npm audit\` to confirm the repository is back to its pre-override state before deciding on a different remediation.
+`;
 }
 
 function prBody(change, advisory) {
@@ -414,12 +552,13 @@ function prBody(change, advisory) {
 ## Remediation
 - Type: \`${change.type}\`
 - Change: \`${quote(change.changedPackage)}\` from \`${quote(change.oldRange)}\` to \`${quote(change.newVersion)}\`
+- Rationale: ${strategyExplanation(change)}
 - Auto-merge: disabled by design
-
+${overrideSection(change)}
 ## Validation
 - [x] Lockfile regenerated with npm
 - [x] npm audit no longer reports the affected package
-- [x] \`npm ci --ignore-scripts\`
+- [x] \`npm ci --ignore-scripts\`${change.requiresCompatibility ? '\n- [x] REMEDIATION_VALIDATION commands (required: this change needs compatibility verification)' : ''}
 `;
 }
 
@@ -466,7 +605,10 @@ function validate(change) {
   }
   const commands = (process.env.REMEDIATION_VALIDATION || '').split('\n').map((item) => item.trim()).filter(Boolean);
   if (change.requiresCompatibility && !commands.length) {
-    throw new Error(`Major upgrade for ${change.changedPackage} needs REMEDIATION_VALIDATION (for example: npm test, npm run lint, npm run build).`);
+    const reason = change.type === 'override'
+      ? `Override for ${change.vulnerablePackage} needs REMEDIATION_VALIDATION (overrides can change the resolved version for every dependent, not just the vulnerable path)`
+      : `Major upgrade for ${change.changedPackage} needs REMEDIATION_VALIDATION`;
+    throw new Error(`${reason} (for example: npm test, npm run lint, npm run build).`);
   }
   for (const command of commands) {
     runShell(command);
@@ -523,7 +665,7 @@ async function main() {
 
     if (dryRun) {
       created += 1;
-      console.log(`Dry run: would create ${branch} for ${candidate.packageName} against ${base}.`);
+      console.log(`Dry run: would create ${branch} (${previewChange.type}) for ${candidate.packageName} against ${base}.`);
       continue;
     }
 
@@ -555,7 +697,7 @@ async function main() {
     });
     pulls.push(pull);
     created += 1;
-    console.log(`Created PR: ${pull.html_url}`);
+    console.log(`Created PR (${change.type}): ${pull.html_url}`);
   }
   console.log(`Remediation run complete: ${created} ${dryRun ? 'planned' : 'created'}, ${skipped} skipped, limit ${limit}.`);
 }
