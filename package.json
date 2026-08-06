@@ -32,5 +32,8 @@
     "nodemon": "^2.0.22",
     "nyc": "^15.1.0",
     "sinon": "^15.2.0"
+  },
+  "overrides": {
+    "get-func-name": "2.0.1"
   }
 }
