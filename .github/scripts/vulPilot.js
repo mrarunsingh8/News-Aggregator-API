@@ -17,9 +17,8 @@
  *   REMEDIATION_DRY_RUN      "true" skips branch/PR creation
  *   MAX_PRS                  maximum remediation PRs to create (default: 3)
  *   REMEDIATION_VALIDATION   newline-separated commands, e.g. "npm test\nnpm run lint"
- *   REMEDIATION_PLAN         required for transitive remediations, for example:
+ *   REMEDIATION_PLAN         optional explicit parent-bump plan, for example:
  *                            {"package":"qs","strategy":"transitive-bump","parent":{"name":"body-parser","version":"1.20.3"}}
- *                            {"package":"qs","strategy":"transitive-override","fixedVersion":"6.13.5","parent":"body-parser"}
  *
  * The script intentionally does not call `npm audit fix` or use `--force`:
  * either can modify unrelated packages, violating the one-vulnerability-per-PR
@@ -334,23 +333,10 @@ function selectChange(manifest, packageName, vulnerability, plan) {
     };
   }
 
-  if (plan?.strategy && plan.strategy !== 'transitive-override') {
+  if (plan?.strategy && plan.strategy !== 'transitive-bump') {
     throw new Error(`Unsupported remediation strategy: ${plan.strategy}`);
   }
-  if (!fixedVersion) throw new Error(`No fixed version is available for nested ${packageName}.`);
-
-  // No compatible parent upgrade was identified. Scope the override to the
-  // top-level parent that introduces the package. When the same package is
-  // also direct, update it in the manifest as well.
-  return {
-    type: 'transitive-override', vulnerablePackage: packageName, changedPackage: packageName,
-    oldRange: directSection ? manifest[directSection][packageName] : 'transitive', newVersion: fixedVersion,
-    parent: parentName, requiresCompatibility: isMajorUpgrade(packageName, directSection ? manifest[directSection][packageName] : '*', fixedVersion),
-    apply() {
-      if (directSection) manifest[directSection][packageName] = fixedVersion;
-      setOverride(manifest, packageName, fixedVersion, parentName);
-    },
-  };
+  throw new Error(`No safe direct or parent upgrade was found for nested ${packageName}; override remediation is disabled by policy.`);
 }
 
 function severityRank(severity) {
@@ -412,13 +398,10 @@ function branchName(change, advisory) {
 function prTitle(change, advisory) {
   if (change.type === 'direct') return `security(direct): remediate ${advisory.id} in ${change.changedPackage}`;
   if (change.type === 'transitive-bump') return `security(transitive): remediate ${advisory.id} via ${change.changedPackage}`;
-  return `security(override): remediate ${advisory.id} in ${change.changedPackage}`;
+  return `security(transitive): remediate ${advisory.id} via ${change.changedPackage}`;
 }
 
 function prBody(change, advisory) {
-  const lifecycle = change.type === 'transitive-override'
-    ? `\n## Override lifecycle\n- Temporary ${change.parent ? `override scoped to \`${quote(change.parent)}\`` : 'root-level override'}.\n- Remove it once an upstream parent resolves the dependency safely.\n- Review it during the next dependency-maintenance cycle.\n`
-    : '';
   const source = advisory.url ? `[${advisory.id}](${advisory.url})` : `\`${advisory.id}\``;
   return `## Vulnerability
 - Source: npm audit
@@ -437,7 +420,7 @@ function prBody(change, advisory) {
 - [x] Lockfile regenerated with npm
 - [x] npm audit no longer reports the affected package
 - [x] \`npm ci --ignore-scripts\`
-${lifecycle}`;
+`;
 }
 
 async function api(token, path, options = {}) {
