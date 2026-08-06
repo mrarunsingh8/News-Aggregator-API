@@ -288,6 +288,86 @@ function topParent(manifest, packageName, vulnerability) {
   return null;
 }
 
+function vulnerabilityRanges(vulnerability) {
+  const ranges = (vulnerability.via || [])
+    .filter((item) => typeof item === 'object' && item.range)
+    .map((item) => item.range);
+  if (!ranges.length && vulnerability.range) ranges.push(vulnerability.range);
+  return [...new Set(ranges)];
+}
+
+function resolvedPackageEntries(packageName, lockfile = readJson('package-lock.json')) {
+  const entries = [];
+  for (const [packagePath, value] of Object.entries(lockfile.packages || {})) {
+    if (!value?.version) continue;
+    if (packagePath === `node_modules/${packageName}` || packagePath.endsWith(`/node_modules/${packageName}`)) {
+      entries.push({ path: packagePath, version: value.version });
+    }
+  }
+  if (!entries.length && lockfile.dependencies?.[packageName]?.version) {
+    entries.push({ path: `dependencies.${packageName}`, version: lockfile.dependencies[packageName].version });
+  }
+  return entries;
+}
+
+function resolutionState(packageName, vulnerability, expectedFixedVersion) {
+  const semver = semverLibrary();
+  const ranges = vulnerabilityRanges(vulnerability);
+  const entries = resolvedPackageEntries(packageName);
+  const vulnerable = entries.filter((item) => semver.valid(item.version)
+    && ranges.some((range) => semver.satisfies(item.version, range)));
+  const belowExpected = expectedFixedVersion && semver.valid(expectedFixedVersion)
+    ? entries.filter((item) => !semver.valid(item.version) || semver.lt(item.version, expectedFixedVersion))
+    : [];
+  return {
+    entries,
+    vulnerable,
+    belowExpected,
+    ranges,
+    expectedFixedVersion,
+  };
+}
+
+function resolutionEvidenceMarkdown(state) {
+  const versionList = [...new Set(state.entries.map((item) => item.version))];
+  const lines = [
+    `- Expected safe version for vulnerable package: \`${quote(state.expectedFixedVersion || 'unknown')}\``,
+    `- Vulnerable ranges from advisory: \`${quote(state.ranges.join(' || ') || 'unknown')}\``,
+    `- Resolved versions after parent upgrade attempt: ${versionList.length ? versionList.map((version) => `\`${quote(version)}\``).join(', ') : '_not present_'}`,
+  ];
+  if (!state.entries.length) {
+    lines.push('- Dependency tree evidence: package was not present in package-lock after parent upgrade attempt.');
+    return lines.join('\n');
+  }
+  lines.push('- Dependency tree evidence:');
+  for (const item of state.entries.slice(0, 8)) {
+    const marker = state.vulnerable.find((candidate) => candidate.path === item.path && candidate.version === item.version) ? ' (still vulnerable)' : '';
+    lines.push(`  - \`${quote(item.path)}\` -> \`${quote(item.version)}\`${marker}`);
+  }
+  if (state.entries.length > 8) {
+    lines.push(`  - ... ${state.entries.length - 8} additional path(s) omitted`);
+  }
+  return lines.join('\n');
+}
+
+function buildOverrideReasons(change, validationError, state) {
+  const reasons = [];
+  const errorText = validationError?.message || '';
+  if (errorText.includes('npm audit still reports')) {
+    reasons.push('The latest available parent version still resolves to a vulnerable transitive dependency.');
+  }
+  if (change.isSemVerMajor) {
+    reasons.push('Upgrading the parent dependency would introduce breaking changes and is therefore not a safe remediation.');
+  }
+  if (state.vulnerable.length && state.entries.length > 1) {
+    reasons.push('The vulnerable package exists in multiple dependency paths, and an override is the only practical way to enforce the required safe version.');
+  }
+  if (!reasons.length) {
+    reasons.push('The parent dependency has no compatible version that upgrades the vulnerable transitive package.');
+  }
+  return reasons;
+}
+
 function isMajorUpgrade(packageName, oldRange, newVersion) {
   const semver = semverLibrary();
   const current = lockedVersion(packageName) || semver.minVersion(oldRange)?.version;
@@ -315,7 +395,7 @@ function setOverride(manifest, vulnerablePackage, fixedVersion, parent) {
   manifest.overrides[parent] = { ...(manifest.overrides[parent] || {}), [vulnerablePackage]: fixedVersion };
 }
 
-function selectChange(manifest, packageName, vulnerability, plan) {
+function selectChange(manifest, packageName, vulnerability, plan, options = {}) {
   const directSection = dependencySection(manifest, packageName);
   const auditFixedVersion = fixedVersionFromAudit(vulnerability, packageName);
   const fix = availableFix(vulnerability);
@@ -376,6 +456,11 @@ function selectChange(manifest, packageName, vulnerability, plan) {
     throw new Error(`Unsupported remediation strategy: ${plan.strategy}`);
   }
   if (!fixedVersion) throw new Error(`No fixed version is available for nested ${packageName}.`);
+  const defaultState = options.overrideEvidence ? null : resolutionState(packageName, vulnerability, fixedVersion);
+  const defaultReasons = ['The parent dependency has no compatible version that upgrades the vulnerable transitive package.'];
+  if (defaultState?.vulnerable?.length && defaultState.entries.length > 1) {
+    defaultReasons.push('The vulnerable package exists in multiple dependency paths, and an override is the only practical way to enforce the required safe version.');
+  }
 
   // No compatible parent upgrade was identified. Scope the override to the
   // top-level parent that introduces the package. When the same package is
@@ -384,6 +469,9 @@ function selectChange(manifest, packageName, vulnerability, plan) {
     type: 'transitive-override', vulnerablePackage: packageName, changedPackage: packageName,
     oldRange: directSection ? manifest[directSection][packageName] : 'transitive', newVersion: fixedVersion,
     parent: parentName, isSemVerMajor: isMajorUpgrade(packageName, directSection ? manifest[directSection][packageName] : '*', fixedVersion),
+    overrideReasons: options.overrideReasons || defaultReasons,
+    overrideEvidence: options.overrideEvidence || resolutionEvidenceMarkdown(defaultState),
+    parentAttempt: options.parentAttempt || null,
     apply() {
       if (directSection) manifest[directSection][packageName] = fixedVersion;
       setOverride(manifest, packageName, fixedVersion, parentName);
@@ -458,6 +546,9 @@ function prBody(change, advisory) {
     isSemVerMajor: change.isSemVerMajor,
     type: change.type === 'transitive-override' ? 'override' : change.type,
   });
+  const overrideRationale = change.type === 'transitive-override'
+    ? `\n## Override rationale\n- Why parent upgrade was insufficient:\n${(change.overrideReasons || []).map((reason) => `  - ${reason}`).join('\n')}\n${change.parentAttempt ? `- Parent upgrade attempted: \`${quote(change.parentAttempt.name)}\` from \`${quote(change.parentAttempt.from)}\` to \`${quote(change.parentAttempt.to)}\`\n` : ''}${change.overrideEvidence ? `- Evidence that override is required:\n${change.overrideEvidence}\n` : ''}`
+    : '';
   const lifecycle = change.type === 'transitive-override'
     ? `\n## Override lifecycle\n- Temporary ${change.parent ? `override scoped to \`${quote(change.parent)}\`` : 'root-level override'}.\n- Remove it once an upstream parent resolves the dependency safely.\n- Review it during the next dependency-maintenance cycle.\n`
     : '';
@@ -483,6 +574,7 @@ ${risk.reasons.map((reason) => `- ${reason}`).join('\n')}
 - [x] Lockfile regenerated with npm
 - [x] npm audit no longer reports the affected package
 - [x] \`npm ci --ignore-scripts\`
+${overrideRationale}
 ${lifecycle}`;
 }
 
@@ -594,16 +686,59 @@ async function main() {
     // never leak into another remediation PR.
     run('git', ['checkout', '-B', branch, base]);
     const workingManifest = readJson('package.json');
-    const change = selectChange(workingManifest, candidate.packageName, candidate.vulnerability, plan);
+    let change = selectChange(workingManifest, candidate.packageName, candidate.vulnerability, plan);
     change.apply();
     writeJson('package.json', workingManifest);
     try {
       validate(change);
     } catch (error) {
+      const canFallback = change.type === 'transitive-bump' && plan?.strategy !== 'transitive-override';
+      if (!canFallback) {
+        restoreBaseFiles(base);
+        skipped += 1;
+        console.log(`Skipping ${candidate.packageName}: candidate did not fully remove the audit finding (${error.message}).`);
+        continue;
+      }
+
+      const expectedFixedVersion = fixedVersionFromAudit(candidate.vulnerability, candidate.packageName)
+        || fixedVersionFromRegistry(candidate.packageName, '*', candidate.vulnerability, { allowMajor: true });
+      const state = resolutionState(candidate.packageName, candidate.vulnerability, expectedFixedVersion);
+      const overrideReasons = buildOverrideReasons(change, error, state);
+      const overrideEvidence = resolutionEvidenceMarkdown(state);
+      const parentAttempt = {
+        name: change.changedPackage,
+        from: change.oldRange,
+        to: change.newVersion,
+      };
+      console.log(`Parent upgrade insufficient for ${candidate.packageName}; falling back to override.`);
+      for (const reason of overrideReasons) console.log(`- ${reason}`);
+
       restoreBaseFiles(base);
-      skipped += 1;
-      console.log(`Skipping ${candidate.packageName}: candidate did not fully remove the audit finding (${error.message}).`);
-      continue;
+      run('git', ['checkout', '-B', branch, base]);
+      const overrideManifest = readJson('package.json');
+      const overridePlan = {
+        package: candidate.packageName,
+        strategy: 'transitive-override',
+        fixedVersion: expectedFixedVersion,
+        parent: parentAttempt.name,
+      };
+      try {
+        change = selectChange(
+          overrideManifest,
+          candidate.packageName,
+          candidate.vulnerability,
+          overridePlan,
+          { overrideReasons, overrideEvidence, parentAttempt },
+        );
+        change.apply();
+        writeJson('package.json', overrideManifest);
+        validate(change);
+      } catch (overrideError) {
+        restoreBaseFiles(base);
+        skipped += 1;
+        console.log(`Skipping ${candidate.packageName}: override fallback failed (${overrideError.message}).`);
+        continue;
+      }
     }
 
     run('git', ['config', 'user.name', 'github-actions[bot]']);
