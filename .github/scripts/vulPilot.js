@@ -128,7 +128,7 @@ function auditReport() {
   }
 }
 
-function advisoryDetails(vulnerability, packageName) {
+function advisoryDetails(vulnerability, packageName, manifest) {
   const details = (vulnerability.via || []).find((item) => typeof item === 'object') || {};
   const url = details.url || '';
   const ghsa = url.match(/GHSA-[\w-]+/i)?.[0]?.toUpperCase();
@@ -139,6 +139,7 @@ function advisoryDetails(vulnerability, packageName) {
     title: details.title || `${packageName} vulnerability reported by npm audit`,
     severity: details.severity || vulnerability.severity || 'unknown',
     range: details.range || vulnerability.range || 'unknown',
+    isDirect: isDirectDependency(manifest, packageName),
   };
 }
 
@@ -200,6 +201,43 @@ function dependencySection(manifest, name) {
     if (manifest[section] && Object.hasOwn(manifest[section], name)) return section;
   }
   return null;
+}
+
+function isDirectDependency(packageJson, packageName) {
+  return Boolean(
+    packageJson.dependencies?.[packageName]
+      || packageJson.devDependencies?.[packageName]
+      || packageJson.optionalDependencies?.[packageName],
+  );
+}
+
+function classifyRisk(advisory, plan) {
+  const reasons = [];
+  let score = 0;
+
+  if (plan.isSemVerMajor) {
+    score += 2;
+    reasons.push('The remediation requires a semver-major dependency change.');
+  }
+  if (!advisory.isDirect) {
+    score += 1;
+    reasons.push('The affected package is transitive, so behavior depends on the parent dependency tree.');
+  }
+  if (plan.type === 'override') {
+    score += 1;
+    reasons.push('The remediation uses npm overrides, which should be reviewed against parent package compatibility.');
+  }
+  if (['critical', 'high'].includes(advisory.severity)) {
+    reasons.push(`The advisory severity is ${advisory.severity}.`);
+  }
+  if (reasons.length === 0) {
+    reasons.push('Patch is limited to package metadata and lockfile changes, with validation checks passing.');
+  }
+
+  return {
+    level: score >= 3 ? 'High' : score >= 1 ? 'Medium' : 'Low',
+    reasons,
+  };
 }
 
 function latestParentUpgrade(packageName, declaredRange) {
@@ -293,7 +331,7 @@ function selectChange(manifest, packageName, vulnerability, plan) {
       return {
         type: 'transitive-bump', vulnerablePackage: packageName, changedPackage: fix.name,
         oldRange: manifest[fixedParentSection][fix.name], newVersion: fix.version,
-        requiresCompatibility: isMajorUpgrade(fix.name, manifest[fixedParentSection][fix.name], fix.version),
+        isSemVerMajor: isMajorUpgrade(fix.name, manifest[fixedParentSection][fix.name], fix.version),
         apply() { manifest[fixedParentSection][fix.name] = fix.version; },
       };
     }
@@ -305,7 +343,7 @@ function selectChange(manifest, packageName, vulnerability, plan) {
       return {
         type: 'transitive-bump', vulnerablePackage: packageName, changedPackage: parentName,
         oldRange: manifest[parentSection][parentName], newVersion: targetVersion,
-        requiresCompatibility: isMajorUpgrade(parentName, manifest[parentSection][parentName], targetVersion),
+        isSemVerMajor: isMajorUpgrade(parentName, manifest[parentSection][parentName], targetVersion),
         apply() { manifest[parentSection][parentName] = `^${targetVersion}`; },
       };
     }
@@ -316,7 +354,7 @@ function selectChange(manifest, packageName, vulnerability, plan) {
     return {
       type: 'direct', vulnerablePackage: packageName, changedPackage: packageName,
       oldRange: manifest[directSection][packageName], newVersion: fixedVersion,
-      requiresCompatibility: isMajorUpgrade(packageName, manifest[directSection][packageName], fixedVersion),
+      isSemVerMajor: isMajorUpgrade(packageName, manifest[directSection][packageName], fixedVersion),
       apply() { manifest[directSection][packageName] = fixedVersion; },
     };
   }
@@ -329,7 +367,7 @@ function selectChange(manifest, packageName, vulnerability, plan) {
     return {
       type: 'transitive-bump', vulnerablePackage: packageName, changedPackage: parent.name,
       oldRange: manifest[parentSection][parent.name], newVersion: parent.version,
-      requiresCompatibility: isMajorUpgrade(parent.name, manifest[parentSection][parent.name], parent.version),
+      isSemVerMajor: isMajorUpgrade(parent.name, manifest[parentSection][parent.name], parent.version),
       apply() { manifest[parentSection][parent.name] = parent.version; },
     };
   }
@@ -345,7 +383,7 @@ function selectChange(manifest, packageName, vulnerability, plan) {
   return {
     type: 'transitive-override', vulnerablePackage: packageName, changedPackage: packageName,
     oldRange: directSection ? manifest[directSection][packageName] : 'transitive', newVersion: fixedVersion,
-    parent: parentName, requiresCompatibility: isMajorUpgrade(packageName, directSection ? manifest[directSection][packageName] : '*', fixedVersion),
+    parent: parentName, isSemVerMajor: isMajorUpgrade(packageName, directSection ? manifest[directSection][packageName] : '*', fixedVersion),
     apply() {
       if (directSection) manifest[directSection][packageName] = fixedVersion;
       setOverride(manifest, packageName, fixedVersion, parentName);
@@ -393,7 +431,7 @@ function selectCandidates(manifest, report, plan, requestedPackage) {
       candidates.push({
         packageName,
         vulnerability,
-        advisory: advisoryDetails(vulnerability, packageName),
+        advisory: advisoryDetails(vulnerability, packageName, manifest),
       });
     } catch (error) {
       reasons.push(`${packageName}: ${error.message}`);
@@ -416,6 +454,10 @@ function prTitle(change, advisory) {
 }
 
 function prBody(change, advisory) {
+  const risk = classifyRisk(advisory, {
+    isSemVerMajor: change.isSemVerMajor,
+    type: change.type === 'transitive-override' ? 'override' : change.type,
+  });
   const lifecycle = change.type === 'transitive-override'
     ? `\n## Override lifecycle\n- Temporary ${change.parent ? `override scoped to \`${quote(change.parent)}\`` : 'root-level override'}.\n- Remove it once an upstream parent resolves the dependency safely.\n- Review it during the next dependency-maintenance cycle.\n`
     : '';
@@ -432,6 +474,10 @@ function prBody(change, advisory) {
 - Type: \`${change.type}\`
 - Change: \`${quote(change.changedPackage)}\` from \`${quote(change.oldRange)}\` to \`${quote(change.newVersion)}\`
 - Auto-merge: disabled by design
+
+## Risk assessment
+- Level: ${risk.level}
+${risk.reasons.map((reason) => `- ${reason}`).join('\n')}
 
 ## Validation
 - [x] Lockfile regenerated with npm
@@ -482,7 +528,7 @@ function validate(change) {
     throw new Error(`npm audit still reports ${change.vulnerablePackage}; refusing to create a PR.`);
   }
   const commands = (process.env.REMEDIATION_VALIDATION || '').split('\n').map((item) => item.trim()).filter(Boolean);
-  if (change.requiresCompatibility && !commands.length) {
+  if (change.isSemVerMajor && !commands.length) {
     throw new Error(`Major upgrade for ${change.changedPackage} needs REMEDIATION_VALIDATION (for example: npm test, npm run lint, npm run build).`);
   }
   for (const command of commands) {
